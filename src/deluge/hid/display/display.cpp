@@ -90,7 +90,9 @@ std::string_view getErrorMessage(Error error) {
 	}
 }
 
+#if !DELUGELITE_7SEG_ONLY
 bool have_oled_screen = false;
+#endif
 
 void wait_for_select_encoder_press() {
 	// The PIC reports press and release with the same button code, prefixing releases with NEXT_PAD_OFF. Ignoring
@@ -119,6 +121,9 @@ void wait_for_select_encoder_press() {
 }
 
 void swapDisplayType() {
+#if DELUGELITE_7SEG_ONLY
+	return; // DelugeLite: no OLED to swap to
+#endif
 	using ::display; // this is c++
 	bool was_oled = display->haveOLED();
 	delete display;

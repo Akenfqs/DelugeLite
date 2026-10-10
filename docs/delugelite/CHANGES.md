@@ -11,8 +11,8 @@ internal SRAM left over for voices, sounds and clips; the upstream baseline is *
 
 | ID | Change | Type | Effect | Verified on HW? | Revert |
 |---|---|---|---|---|---|
-| DL-003 | 7-segment-only build (`DELUGELITE_7SEG_ONLY`, default ON) | removal | see entry | no | `-DDELUGELITE_7SEG_ONLY=OFF` |
-| DL-002 | Audio block 256 samples (`DELUGELITE_AUDIO_BLOCK_SAMPLES`, default 256) | perf / latency | +~3 ms output latency; est. 5–10 % less audio CPU in dense songs | no | `-DDELUGELITE_AUDIO_BLOCK_SAMPLES=128` |
+| DL-003 | 7-segment-only build (`DELUGELITE_7SEG_ONLY`, default ON) | removal | **+27,200 B fast heap** (−25.9 KB code) | no | `-DDELUGELITE_7SEG_ONLY=OFF` |
+| DL-002 | Audio block 256 samples (`DELUGELITE_AUDIO_BLOCK_SAMPLES`, default 256) | perf / latency | +~3 ms output latency; est. 5–10 % less audio CPU in dense songs; **−7,040 B fast heap**, −2,560 B frunk (bigger buffers) | no | `-DDELUGELITE_AUDIO_BLOCK_SAMPLES=128` |
 | DL-001 | Fix out-of-range dereference in `AudioEngine::killOneVoice()` | bug fix | removes a crash/UB when a hard cull happens with only audio clips sounding | no | revert commit |
 
 ---
@@ -26,7 +26,15 @@ The target hardware has the 7-segment display, so OLED support is compiled out:
 - Boot never selects the OLED (`deluge.cpp`).
 - The emulated-display swap (`swapDisplayType`) is disabled.
 
-**Effect:** see the measurement table in the commit and in [ROADMAP.md](ROADMAP.md).
+**Measured effect** (Release build; DL-002 at 256 is the baseline):
+
+| item | before | after | delta |
+|---|---|---|---|
+| `.text` | 1,165,032 | 1,139,136 | −25,896 |
+| `.bss` | 188,072 | 187,104 | −968 |
+| fast heap at boot | 1,134,700 | **1,161,900** | **+27,200** |
+
+Running total vs upstream: fast heap 1,141,740 → 1,161,900 (**+20,160 B**).
 
 **Caveat:** a 7SEG_ONLY build shows nothing on an OLED unit. Everything else still works there.
 

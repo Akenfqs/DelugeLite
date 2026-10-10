@@ -79,6 +79,12 @@ if(NOT DELUGELITE_AUDIO_BLOCK_SAMPLES MATCHES "^(128|256)$")
 endif()
 add_compile_definitions(DELUGELITE_AUDIO_BLOCK_SAMPLES=${DELUGELITE_AUDIO_BLOCK_SAMPLES})
 
+# DelugeLite: compile out OLED support (the target hardware has the 7-segment display). See docs/delugelite/CHANGES.md
+option(DELUGELITE_7SEG_ONLY "Build for 7-segment display only (OLED code paths compiled out)" ON)
+if(DELUGELITE_7SEG_ONLY)
+    add_compile_definitions(DELUGELITE_7SEG_ONLY=1)
+endif()
+
 # Colored output
 set(CMAKE_COLOR_DIAGNOSTICS ON)
 add_compile_options($<$<CXX_COMPILER_ID:Clang>:-fansi-escape-codes>)

@@ -111,8 +111,14 @@ public:
 
 	virtual std::array<uint8_t, kNumericDisplayLength> getLast() { return {0}; }; // to match SevenSegment
 
+#if DELUGELITE_7SEG_ONLY
+	// DelugeLite: compile-time constants so every OLED-only branch folds away
+	constexpr bool haveOLED() const { return false; }
+	constexpr bool have7SEG() const { return true; }
+#else
 	bool haveOLED() { return displayType == DisplayType::OLED; }
 	bool have7SEG() { return displayType == DisplayType::SEVENSEG; }
+#endif
 
 private:
 	DisplayType displayType;
@@ -127,7 +133,11 @@ void swapDisplayType();
 /// Blocks until the select encoder is newly pressed. Used by freezeWithError() to offer "attempt resume".
 void wait_for_select_encoder_press();
 // physical screen is oled
+#if DELUGELITE_7SEG_ONLY
+constexpr bool have_oled_screen = false;
+#else
 extern bool have_oled_screen;
+#endif
 } // namespace deluge::hid::display
 
 extern "C" void consoleTextIfAllBootedUp(char const* text);

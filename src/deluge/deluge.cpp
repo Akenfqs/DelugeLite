@@ -644,7 +644,13 @@ void mainLoop() {
 extern "C" int32_t deluge_main(void) {
 	// Piggyback off of bootloader DMA setup.
 	uint32_t oledSPIDMAConfig = (0b1101000 | (OLED_SPI_DMA_CHANNEL & 7));
+#if DELUGELITE_7SEG_ONLY
+	// DelugeLite: 7-segment-only build - ignore any OLED the bootloader may have set up
+	(void)oledSPIDMAConfig;
+	constexpr bool have_oled = false;
+#else
 	bool have_oled = ((DMACn(OLED_SPI_DMA_CHANNEL).CHCFG_n & oledSPIDMAConfig) == oledSPIDMAConfig);
+#endif
 
 	// Give the PIC some startup instructions
 	if (have_oled) {
@@ -716,7 +722,9 @@ extern "C" int32_t deluge_main(void) {
 		display = new deluge::hid::display::SevenSegment;
 	}
 	// remember the physical display type
+#if !DELUGELITE_7SEG_ONLY
 	deluge::hid::display::have_oled_screen = have_oled;
+#endif
 
 	// Setup audio output on SSI0
 	ssiInit(0, 1);
