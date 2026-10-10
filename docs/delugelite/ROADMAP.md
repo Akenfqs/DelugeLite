@@ -140,17 +140,17 @@ These features also cost runtime RAM or CPU:
 
 Decide these after Phases 1 and 2, using the size budget from Phase 0.
 
-## 3. Decisions needed from you
+## 3. Decisions (answered 2026-10-10)
 
-1. **Repository base:** import upstream `main` with full history (recommended, so upstream fixes
-   can be merged), or squash it into a single initial commit?
-2. **Branch to track:** upstream `main` (c1.3 dev) or the last stable release `release/1.2`
-   (c1.2.1)?
-3. **Latency:** may the audio buffer be doubled? It adds ~3 ms of latency and saves 10–20 % of
-   per-buffer overhead.
-4. **File compatibility:** keep loading existing songs and kits, and silently ignore tags for
-   removed features? This is the default plan.
-5. **Feature list:** which features you personally never use. That decides the order of Phase 2.
+1. **Repository base:** upstream `main`, imported with full history. Done.
+2. **Branch to track:** upstream `main`, i.e. the c1.3 line.
+3. **Latency:** a doubled audio block is accepted, on condition that every detail is logged and
+   there is a plan to win the latency back. See [LATENCY.md](LATENCY.md) (DL-002).
+4. **File compatibility:** keep loading existing files where possible, but this is not a hard
+   requirement.
+5. **Feature list:** still open. The user is thinking about it.
+6. **Displays:** the target is 7-segment only, so OLED support may be removed (DL-003).
+7. **Testing:** the user tests on the 7-segment unit, following [TESTING.md](TESTING.md).
 
 ## 4. Things I could not determine from code
 
