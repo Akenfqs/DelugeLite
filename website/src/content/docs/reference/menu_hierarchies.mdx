@@ -1,0 +1,162 @@
+---
+title: Menu Hierarchies
+sidebar:
+  order: 2
+---
+
+import FirmwareMenuSection from "../../../components/FirmwareMenuSection.astro"
+
+This document will document the menu structure hierarchy currently in place in the deluge in order to help users understand what exists in the menu structure and how the hierarchy strings are defined for OLED and 7SEG users.
+
+By default, the hierarchies below show the 7SEG display text first, followed by the OLED display text. In addition, only the first 4 characters of the 7SEG text is shown below by default. In some cases, longer text may be displayed on 7SEG. You can show this by clicking on the 7SEG text where available.
+
+## Settings
+
+<details>
+  <summary>Settings Menu</summary>
+
+The Settings menu is accessible from anywhere on the Deluge by pressing :key[SHIFT] + :key[SELECT].
+It is used for configuring default settings that persist after the Deluge has been turned off.
+
+The Settings menu contains the following menu hierarchy:
+
+  <FirmwareMenuSection treeKey="settingsMenu" />
+</details>
+
+## Song
+
+<details>
+  <summary>Song Menu</summary>
+
+The Song menu is accessible from Arranger View and Song View by pressing :key[SELECT].
+
+The Song menu contains the following menu hierarchy:
+
+  <FirmwareMenuSection treeKey="songMenu" />
+</details>
+
+<details>
+  <summary>Song Clip Settings Menu</summary>
+
+The Clip Settings menu is accessible from Song Grid View by holding a clip :key[PAD] and pressing :key[SELECT].
+
+The Clip Settings menu contains the following menu hierarchy:
+
+  <FirmwareMenuSection treeKey="songClipSettingsMenu" />
+</details>
+
+<details>
+  <summary>Perform FX Menu</summary>
+
+The Perform FX menu is accessible from Performance View by pressing :key[SELECT].
+
+The Perform FX menu contains the following menu hierarchy:
+
+  <FirmwareMenuSection treeKey="performFxMenu" />
+</details>
+
+## Clip
+
+### Audio Clip
+
+<details>
+  <summary>Audio Clip Menu</summary>
+
+The Audio Clip menu is accessible from audio clips by pressing :key[SELECT].
+
+The Audio Clip menu contains the following menu hierarchy:
+
+  <FirmwareMenuSection treeKey="audioClipMenu" />
+</details>
+
+### Instrument Clip
+
+<details>
+  <summary>Synth Sound Menu</summary>
+
+The Synth Sound menu is accessible from Synth Clips.
+
+The Synth Sound menu contains the following menu hierarchy:
+
+  <FirmwareMenuSection treeKey="synthSoundMenu" />
+</details>
+
+<details>
+  <summary>Kit FX Menu</summary>
+
+The Kit FX menu is accessible from Kit clips when :key[AffectEntire] is enabled by pressing :key[SELECT].
+
+The Kit FX menu contains the following menu hierarchy:
+
+  <FirmwareMenuSection treeKey="kitFxMenu" />
+</details>
+
+<details>
+  <summary>Kit Sound Drum Menu</summary>
+
+The Kit Sound Drum menu is accessible from Kit Clips when :key[AffectEntire] is disabled and a Sound Drum row is selected, then pressing :key[SELECT]
+
+The Kit Sound Drum menu contains the following menu hierarchy:
+
+  <FirmwareMenuSection treeKey="kitSoundDrumMenu" />
+</details>
+
+<details>
+  <summary>Kit MIDI Drum Menu</summary>
+
+The Kit MIDI Drum menu is accessible from Kit Clips when :key[AffectEntire] is disabled and a MIDI Drum row is selected, then pressing :key[SELECT]
+
+The Kit MIDI Drum menu contains the following menu hierarchy:
+
+  <FirmwareMenuSection treeKey="kitMidiDrumMenu" />
+</details>
+
+<details>
+  <summary>Kit GATE Drum Menu</summary>
+
+The Kit GATE Drum menu is accessible from Kit Clips when :key[AffectEntire] is disabled and a GATE Drum row is selected, then pressing :key[SELECT]
+
+The Kit GATE Drum menu contains the following menu hierarchy:
+
+  <FirmwareMenuSection treeKey="kitGateDrumMenu" />
+</details>
+
+<details>
+  <summary>MIDI Instrument Menu</summary>
+
+The MIDI Instrument menu is accessible from MIDI clips (or Kit Clips with a MIDI drum selected) by pressing :key[SELECT].
+
+The MIDI Instrument menu contains the following menu hierarchy:
+
+  <FirmwareMenuSection treeKey="midiInstrumentMenu" />
+</details>
+
+<details>
+  <summary>CV Instrument Menu</summary>
+
+The CV Instrument menu is accessible from CV clips (or Kit Clips with a Gate drum selected) by pressing :key[SELECT].
+
+The CV Instrument menu contains the following menu hierarchy:
+
+  <FirmwareMenuSection treeKey="cvInstrumentMenu" />
+</details>
+
+<details>
+  <summary>Note Editor Menu</summary>
+
+The Note Editor menu is accessible from Instrument Clips by holding a :key[NOTE PAD] and pressing :key[SELECT].
+
+The Note Editor menu contains the following menu hierarchy:
+
+  <FirmwareMenuSection treeKey="noteEditorMenu" />
+</details>
+
+<details>
+  <summary>Note Row Editor Menu</summary>
+
+The Note Row Editor menu is accessible from Instrument Clips by holding :key[AUDITION PAD] and pressing :key[SELECT].
+
+The Note Row Editor menu contains the following menu hierarchy:
+
+  <FirmwareMenuSection treeKey="noteRowEditorMenu" />
+</details>

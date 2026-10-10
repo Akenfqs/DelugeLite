@@ -1,0 +1,2044 @@
+/*
+ * Copyright (c) 2024 Sean Ditny
+ *
+ * This file is part of The Synthstrom Audible Deluge Firmware.
+ *
+ * The Synthstrom Audible Deluge Firmware is free software: you can redistribute it and/or modify it under the
+ * terms of the GNU General Public License as published by the Free Software Foundation,
+ * either version 3 of the License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+ * without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along with this program.
+ * If not, see <https://www.gnu.org/licenses/>.
+ */
+
+#include "io/midi/midi_follow.h"
+#include "definitions_cxx.hpp"
+#include "gui/l10n/l10n.h"
+#include "gui/views/arranger_view.h"
+#include "gui/views/automation_view.h"
+#include "gui/views/instrument_clip_view.h"
+#include "gui/views/performance_view.h"
+#include "gui/views/session_view.h"
+#include "gui/views/view.h"
+#include "hid/display/display.h"
+#include "io/midi/midi_device.h"
+#include "io/midi/midi_engine.h"
+#include "io/midi/midi_takeover.h"
+#include "model/clip/clip_instance.h"
+#include "model/clip/instrument_clip.h"
+#include "model/clip/instrument_clip_minder.h"
+#include "model/drum/drum.h"
+#include "model/instrument/kit.h"
+#include "model/instrument/melodic_instrument.h"
+#include "model/note/note_row.h"
+#include "model/song/song.h"
+#include "modulation/params/param.h"
+#include "modulation/params/param_set.h"
+#include "playback/mode/session.h"
+#include "processing/engines/audio_engine.h"
+#include "storage/storage_manager.h"
+#include "util/d_string.h"
+#include <cstdlib>
+
+extern "C" {
+#include "RZA1/uart/sio_char.h"
+}
+
+using namespace deluge;
+using namespace gui;
+
+#define SETTINGS_FOLDER "SETTINGS"
+#define MIDI_FOLLOW_XML "SETTINGS/MIDIFollow.XML"
+#define MIDI_DEFAULTS_TAG "defaults"
+#define MIDI_DEFAULTS_SETTINGS_TAG "settings"
+// channels
+#define MIDI_DEFAULTS_SETTINGS_CHANNELS_TAG "channels"
+#define MIDI_DEFAULTS_SETTINGS_CHANNEL_TAG "channel"
+#define MIDI_DEFAULTS_SETTINGS_DEVICE_TAG "device"
+// root note
+#define MIDI_DEFAULTS_SETTINGS_KITROOTNOTE_TAG "kit_root_note"
+#define MIDI_DEFAULTS_SETTINGS_KITROOTNOTE_NOTE_TAG "note"
+#define MIDI_DEFAULTS_SETTINGS_FEEDBACK_TAG "feedback"
+#define MIDI_DEFAULTS_SETTINGS_FEEDBACK_AUTOMATION_TAG "automation"
+#define MIDI_DEFAULTS_SETTINGS_FEEDBACK_FILTER_TAG "filter"
+#define MIDI_DEFAULTS_SETTINGS_DISPLAYPARAM_TAG "display_param"
+#define MIDI_DEFAULTS_SETTINGS_DISPLAYPARAM_POPUP_TAG "popup"
+#define MIDI_DEFAULTS_CC_TAG "cc_mappings"
+
+constexpr int32_t PARAM_ID_NONE = 255;
+constexpr int32_t MIDI_CC_MUTE = 89;
+constexpr int32_t MIDI_CC_SOLO = 90;
+
+EnumStringMap<MIDIFollowChannelType, kNumMIDIFollowChannelTypesIncludingTracks> channelTypeMap = {
+    {{{MIDIFollowChannelType::A, "a"},
+      {MIDIFollowChannelType::B, "b"},
+      {MIDIFollowChannelType::C, "c"},
+      {MIDIFollowChannelType::Track1, "track_1"},
+      {MIDIFollowChannelType::Track2, "track_2"},
+      {MIDIFollowChannelType::Track3, "track_3"},
+      {MIDIFollowChannelType::Track4, "track_4"},
+      {MIDIFollowChannelType::Track5, "track_5"},
+      {MIDIFollowChannelType::Track6, "track_6"},
+      {MIDIFollowChannelType::Track7, "track_7"},
+      {MIDIFollowChannelType::Track8, "track_8"},
+      {MIDIFollowChannelType::Track9, "track_9"},
+      {MIDIFollowChannelType::Track10, "track_10"},
+      {MIDIFollowChannelType::Track11, "track_11"},
+      {MIDIFollowChannelType::Track12, "track_12"},
+      {MIDIFollowChannelType::Track13, "track_13"},
+      {MIDIFollowChannelType::Track14, "track_14"},
+      {MIDIFollowChannelType::Track15, "track_15"},
+      {MIDIFollowChannelType::Track16, "track_16"}}}};
+
+EnumStringMap<MIDIFollowFeedbackChannelType, kNumMIDIFollowFeedbackChannelTypes> feedbackChannelTypeMap = {
+    {{{MIDIFollowFeedbackChannelType::NONE, "none"},
+      {MIDIFollowFeedbackChannelType::A, "a"},
+      {MIDIFollowFeedbackChannelType::B, "b"},
+      {MIDIFollowFeedbackChannelType::C, "c"},
+      {MIDIFollowFeedbackChannelType::Track, "track"},
+      {MIDIFollowFeedbackChannelType::TrackAndA, "track_a"},
+      {MIDIFollowFeedbackChannelType::TrackAndB, "track_b"},
+      {MIDIFollowFeedbackChannelType::TrackAndC, "track_c"}}}};
+
+EnumStringMap<MIDIFollowFeedbackAutomationMode, kNumMIDIFollowFeedbackAutomationModes> feedbackAutomationModeMap = {
+    {{{MIDIFollowFeedbackAutomationMode::DISABLED, "disabled"},
+      {MIDIFollowFeedbackAutomationMode::LOW, "low"},
+      {MIDIFollowFeedbackAutomationMode::MEDIUM, "medium"},
+      {MIDIFollowFeedbackAutomationMode::HIGH, "high"}}}};
+
+PLACE_SDRAM_BSS MidiFollow midiFollow{};
+
+// initialize variables
+MidiFollow::MidiFollow() {
+	init();
+}
+
+void MidiFollow::init() {
+	initState();
+	initDefaultMappings();
+}
+
+void MidiFollow::factoryReset(bool showPopup) {
+	if (showPopup) {
+		display->displayPopup(display->haveOLED() ? l10n::get(l10n::String::STRING_FOR_RESET_MIDI_FOLLOW)
+		                                          : l10n::get(l10n::String::STRING_FOR_FACTORY_RESET));
+	}
+
+	f_unlink(MIDI_FOLLOW_XML);
+	for (auto& midiChannelType : midiEngine.midiFollowChannelType) {
+		midiChannelType.clear();
+	}
+	midiEngine.midiFollowKitRootNote = 36;
+	midiEngine.midiFollowDisplayParam = false;
+	midiEngine.midiFollowFeedbackChannelType = MIDIFollowFeedbackChannelType::NONE;
+	midiEngine.midiFollowFeedbackAutomation = MIDIFollowFeedbackAutomationMode::DISABLED;
+	midiEngine.midiFollowFeedbackFilter = false;
+	successfullyReadDefaultsFromFile = false;
+	readDefaultsFromFile();
+}
+
+void MidiFollow::initState() {
+	successfullyReadDefaultsFromFile = false;
+	for (int32_t i = 0; i < (kMaxMIDIValue + 1); i++) {
+		timeLastCCSent[i] = 0;
+		previousKnobPos[i] = kNoSelection;
+	}
+
+	timeAutomationFeedbackLastSent = 0;
+}
+
+void MidiFollow::clearMappings() {
+	ccToSoundParam.fill(PARAM_ID_NONE);
+	ccToGlobalParam.fill(PARAM_ID_NONE);
+
+	soundParamToCC.fill(MIDI_CC_NONE);
+	globalParamToCC.fill(MIDI_CC_NONE);
+}
+
+void MidiFollow::initDefaultMappings() {
+	clearMappings();
+
+	// SOUND PARAMS
+	// NOTE: when adding an UNPATCHED param, make sure you add params::UNPATCHED_START to it for the indexes
+
+	ccToSoundParam[3] = params::LOCAL_PITCH_ADJUST;
+	soundParamToCC[params::LOCAL_PITCH_ADJUST] = 3;
+	ccToSoundParam[5] = params::UNPATCHED_START + params::UNPATCHED_PORTAMENTO;
+	soundParamToCC[params::UNPATCHED_START + params::UNPATCHED_PORTAMENTO] = 5;
+	ccToSoundParam[7] = params::GLOBAL_VOLUME_POST_FX;
+	soundParamToCC[params::GLOBAL_VOLUME_POST_FX] = 7;
+	ccToSoundParam[10] = params::LOCAL_PAN;
+	soundParamToCC[params::LOCAL_PAN] = 10;
+	ccToSoundParam[12] = params::LOCAL_OSC_A_PITCH_ADJUST;
+	soundParamToCC[params::LOCAL_OSC_A_PITCH_ADJUST] = 12;
+	ccToSoundParam[13] = params::LOCAL_OSC_B_PITCH_ADJUST;
+	soundParamToCC[params::LOCAL_OSC_B_PITCH_ADJUST] = 13;
+	ccToSoundParam[14] = params::LOCAL_MODULATOR_0_PITCH_ADJUST;
+	soundParamToCC[params::LOCAL_MODULATOR_0_PITCH_ADJUST] = 14;
+	ccToSoundParam[15] = params::LOCAL_MODULATOR_1_PITCH_ADJUST;
+	soundParamToCC[params::LOCAL_MODULATOR_1_PITCH_ADJUST] = 15;
+	ccToSoundParam[16] = params::GLOBAL_MOD_FX_RATE;
+	soundParamToCC[params::GLOBAL_MOD_FX_RATE] = 16;
+	ccToSoundParam[17] = params::UNPATCHED_START + params::UNPATCHED_MOD_FX_FEEDBACK;
+	soundParamToCC[params::UNPATCHED_START + params::UNPATCHED_MOD_FX_FEEDBACK] = 17;
+	ccToSoundParam[18] = params::UNPATCHED_START + params::UNPATCHED_MOD_FX_OFFSET;
+	soundParamToCC[params::UNPATCHED_START + params::UNPATCHED_MOD_FX_OFFSET] = 18;
+	ccToSoundParam[19] = params::LOCAL_FOLD;
+	soundParamToCC[params::LOCAL_FOLD] = 19;
+	ccToSoundParam[20] = params::UNPATCHED_START + params::UNPATCHED_STUTTER_RATE;
+	soundParamToCC[params::UNPATCHED_START + params::UNPATCHED_STUTTER_RATE] = 20;
+	ccToSoundParam[21] = params::LOCAL_OSC_A_VOLUME;
+	soundParamToCC[params::LOCAL_OSC_A_VOLUME] = 21;
+	ccToSoundParam[23] = params::LOCAL_OSC_A_PHASE_WIDTH;
+	soundParamToCC[params::LOCAL_OSC_A_PHASE_WIDTH] = 23;
+	ccToSoundParam[24] = params::LOCAL_CARRIER_0_FEEDBACK;
+	soundParamToCC[params::LOCAL_CARRIER_0_FEEDBACK] = 24;
+	ccToSoundParam[25] = params::LOCAL_OSC_A_WAVE_INDEX;
+	soundParamToCC[params::LOCAL_OSC_A_WAVE_INDEX] = 25;
+	ccToSoundParam[26] = params::LOCAL_OSC_B_VOLUME;
+	soundParamToCC[params::LOCAL_OSC_B_VOLUME] = 26;
+	ccToSoundParam[27] = params::UNPATCHED_START + params::UNPATCHED_COMPRESSOR_THRESHOLD;
+	soundParamToCC[params::UNPATCHED_START + params::UNPATCHED_COMPRESSOR_THRESHOLD] = 27;
+	ccToSoundParam[28] = params::LOCAL_OSC_B_PHASE_WIDTH;
+	soundParamToCC[params::LOCAL_OSC_B_PHASE_WIDTH] = 28;
+	ccToSoundParam[29] = params::LOCAL_CARRIER_1_FEEDBACK;
+	soundParamToCC[params::LOCAL_CARRIER_1_FEEDBACK] = 29;
+	ccToSoundParam[30] = params::LOCAL_OSC_B_WAVE_INDEX;
+	soundParamToCC[params::LOCAL_OSC_B_WAVE_INDEX] = 30;
+	ccToSoundParam[36] = params::UNPATCHED_START + params::UNPATCHED_REVERSE_PROBABILITY;
+	soundParamToCC[params::UNPATCHED_START + params::UNPATCHED_REVERSE_PROBABILITY] = 36;
+	ccToSoundParam[37] = params::UNPATCHED_START + params::UNPATCHED_SPREAD_VELOCITY;
+	soundParamToCC[params::UNPATCHED_START + params::UNPATCHED_SPREAD_VELOCITY] = 37;
+	ccToSoundParam[39] = params::UNPATCHED_START + params::UNPATCHED_ARP_SPREAD_OCTAVE;
+	soundParamToCC[params::UNPATCHED_START + params::UNPATCHED_ARP_SPREAD_OCTAVE] = 39;
+	ccToSoundParam[40] = params::UNPATCHED_START + params::UNPATCHED_ARP_SPREAD_GATE;
+	soundParamToCC[params::UNPATCHED_START + params::UNPATCHED_ARP_SPREAD_GATE] = 40;
+	ccToSoundParam[41] = params::LOCAL_NOISE_VOLUME;
+	soundParamToCC[params::LOCAL_NOISE_VOLUME] = 41;
+	ccToSoundParam[42] = params::UNPATCHED_START + params::UNPATCHED_ARP_RHYTHM;
+	soundParamToCC[params::UNPATCHED_START + params::UNPATCHED_ARP_RHYTHM] = 42;
+	ccToSoundParam[43] = params::UNPATCHED_START + params::UNPATCHED_ARP_SEQUENCE_LENGTH;
+	soundParamToCC[params::UNPATCHED_START + params::UNPATCHED_ARP_SEQUENCE_LENGTH] = 43;
+	ccToSoundParam[44] = params::UNPATCHED_START + params::UNPATCHED_ARP_CHORD_POLYPHONY;
+	soundParamToCC[params::UNPATCHED_START + params::UNPATCHED_ARP_CHORD_POLYPHONY] = 44;
+	ccToSoundParam[45] = params::UNPATCHED_START + params::UNPATCHED_ARP_RATCHET_AMOUNT;
+	soundParamToCC[params::UNPATCHED_START + params::UNPATCHED_ARP_RATCHET_AMOUNT] = 45;
+	ccToSoundParam[46] = params::UNPATCHED_START + params::UNPATCHED_NOTE_PROBABILITY;
+	soundParamToCC[params::UNPATCHED_START + params::UNPATCHED_NOTE_PROBABILITY] = 46;
+	ccToSoundParam[47] = params::UNPATCHED_START + params::UNPATCHED_ARP_BASS_PROBABILITY;
+	soundParamToCC[params::UNPATCHED_START + params::UNPATCHED_ARP_BASS_PROBABILITY] = 47;
+	ccToSoundParam[48] = params::UNPATCHED_START + params::UNPATCHED_ARP_CHORD_PROBABILITY;
+	soundParamToCC[params::UNPATCHED_START + params::UNPATCHED_ARP_CHORD_PROBABILITY] = 48;
+	ccToSoundParam[49] = params::UNPATCHED_START + params::UNPATCHED_ARP_RATCHET_PROBABILITY;
+	soundParamToCC[params::UNPATCHED_START + params::UNPATCHED_ARP_RATCHET_PROBABILITY] = 49;
+	ccToSoundParam[50] = params::UNPATCHED_START + params::UNPATCHED_ARP_GATE;
+	soundParamToCC[params::UNPATCHED_START + params::UNPATCHED_ARP_GATE] = 50;
+	ccToSoundParam[51] = params::GLOBAL_ARP_RATE;
+	soundParamToCC[params::GLOBAL_ARP_RATE] = 51;
+	ccToSoundParam[52] = params::GLOBAL_DELAY_FEEDBACK;
+	soundParamToCC[params::GLOBAL_DELAY_FEEDBACK] = 52;
+	ccToSoundParam[53] = params::GLOBAL_DELAY_RATE;
+	soundParamToCC[params::GLOBAL_DELAY_RATE] = 53;
+	ccToSoundParam[54] = params::LOCAL_MODULATOR_0_VOLUME;
+	soundParamToCC[params::LOCAL_MODULATOR_0_VOLUME] = 54;
+	ccToSoundParam[55] = params::LOCAL_MODULATOR_0_FEEDBACK;
+	soundParamToCC[params::LOCAL_MODULATOR_0_FEEDBACK] = 55;
+	ccToSoundParam[56] = params::LOCAL_MODULATOR_1_VOLUME;
+	soundParamToCC[params::LOCAL_MODULATOR_1_VOLUME] = 56;
+	ccToSoundParam[57] = params::LOCAL_MODULATOR_1_FEEDBACK;
+	soundParamToCC[params::LOCAL_MODULATOR_1_FEEDBACK] = 57;
+	ccToSoundParam[58] = params::GLOBAL_LFO_FREQ_1;
+	soundParamToCC[params::GLOBAL_LFO_FREQ_1] = 58;
+	ccToSoundParam[59] = params::LOCAL_LFO_LOCAL_FREQ_1;
+	soundParamToCC[params::LOCAL_LFO_LOCAL_FREQ_1] = 59;
+	ccToSoundParam[60] = params::UNPATCHED_START + params::UNPATCHED_SIDECHAIN_SHAPE;
+	soundParamToCC[params::UNPATCHED_START + params::UNPATCHED_SIDECHAIN_SHAPE] = 60;
+	// TODO: replace this with the patch cable from sidechain to volume, once midi follow supports patch cables
+	// ccToSoundParam[61] = params::GLOBAL_VOLUME_POST_REVERB_SEND;
+	// soundParamToCC[params::GLOBAL_VOLUME_POST_REVERB_SEND] = 61;
+	ccToSoundParam[62] = params::UNPATCHED_START + params::UNPATCHED_BITCRUSHING;
+	soundParamToCC[params::UNPATCHED_START + params::UNPATCHED_BITCRUSHING] = 62;
+	ccToSoundParam[63] = params::UNPATCHED_START + params::UNPATCHED_SAMPLE_RATE_REDUCTION;
+	soundParamToCC[params::UNPATCHED_START + params::UNPATCHED_SAMPLE_RATE_REDUCTION] = 63;
+	ccToSoundParam[70] = params::LOCAL_LPF_MORPH;
+	soundParamToCC[params::LOCAL_LPF_MORPH] = 70;
+	ccToSoundParam[71] = params::LOCAL_LPF_RESONANCE;
+	soundParamToCC[params::LOCAL_LPF_RESONANCE] = 71;
+	ccToSoundParam[72] = params::LOCAL_ENV_0_RELEASE;
+	soundParamToCC[params::LOCAL_ENV_0_RELEASE] = 72;
+	ccToSoundParam[73] = params::LOCAL_ENV_0_ATTACK;
+	soundParamToCC[params::LOCAL_ENV_0_ATTACK] = 73;
+	ccToSoundParam[74] = params::LOCAL_LPF_FREQ;
+	soundParamToCC[params::LOCAL_LPF_FREQ] = 74;
+	ccToSoundParam[75] = params::LOCAL_ENV_0_DECAY;
+	soundParamToCC[params::LOCAL_ENV_0_DECAY] = 75;
+	ccToSoundParam[76] = params::LOCAL_ENV_0_SUSTAIN;
+	soundParamToCC[params::LOCAL_ENV_0_SUSTAIN] = 76;
+	ccToSoundParam[77] = params::LOCAL_ENV_1_ATTACK;
+	soundParamToCC[params::LOCAL_ENV_1_ATTACK] = 77;
+	ccToSoundParam[78] = params::LOCAL_ENV_1_DECAY;
+	soundParamToCC[params::LOCAL_ENV_1_DECAY] = 78;
+	ccToSoundParam[79] = params::LOCAL_ENV_1_SUSTAIN;
+	soundParamToCC[params::LOCAL_ENV_1_SUSTAIN] = 79;
+	ccToSoundParam[80] = params::LOCAL_ENV_1_RELEASE;
+	soundParamToCC[params::LOCAL_ENV_1_RELEASE] = 80;
+	ccToSoundParam[81] = params::LOCAL_HPF_FREQ;
+	soundParamToCC[params::LOCAL_HPF_FREQ] = 81;
+	ccToSoundParam[82] = params::LOCAL_HPF_RESONANCE;
+	soundParamToCC[params::LOCAL_HPF_RESONANCE] = 82;
+	ccToSoundParam[83] = params::LOCAL_HPF_MORPH;
+	soundParamToCC[params::LOCAL_HPF_MORPH] = 83;
+	ccToSoundParam[84] = params::UNPATCHED_START + params::UNPATCHED_BASS_FREQ;
+	soundParamToCC[params::UNPATCHED_START + params::UNPATCHED_BASS_FREQ] = 84;
+	ccToSoundParam[85] = params::UNPATCHED_START + params::UNPATCHED_TREBLE_FREQ;
+	soundParamToCC[params::UNPATCHED_START + params::UNPATCHED_TREBLE_FREQ] = 85;
+	ccToSoundParam[86] = params::UNPATCHED_START + params::UNPATCHED_BASS;
+	soundParamToCC[params::UNPATCHED_START + params::UNPATCHED_BASS] = 86;
+	ccToSoundParam[87] = params::UNPATCHED_START + params::UNPATCHED_TREBLE;
+	soundParamToCC[params::UNPATCHED_START + params::UNPATCHED_TREBLE] = 87;
+	ccToSoundParam[91] = params::GLOBAL_REVERB_AMOUNT;
+	soundParamToCC[params::GLOBAL_REVERB_AMOUNT] = 91;
+	ccToSoundParam[93] = params::GLOBAL_MOD_FX_DEPTH;
+	soundParamToCC[params::GLOBAL_MOD_FX_DEPTH] = 93;
+	ccToSoundParam[102] = params::LOCAL_ENV_2_ATTACK;
+	soundParamToCC[params::LOCAL_ENV_2_ATTACK] = 102;
+	ccToSoundParam[103] = params::LOCAL_ENV_2_DECAY;
+	soundParamToCC[params::LOCAL_ENV_2_DECAY] = 103;
+	ccToSoundParam[104] = params::LOCAL_ENV_2_SUSTAIN;
+	soundParamToCC[params::LOCAL_ENV_2_SUSTAIN] = 104;
+	ccToSoundParam[105] = params::LOCAL_ENV_2_RELEASE;
+	soundParamToCC[params::LOCAL_ENV_2_RELEASE] = 105;
+	ccToSoundParam[106] = params::LOCAL_ENV_3_ATTACK;
+	soundParamToCC[params::LOCAL_ENV_3_ATTACK] = 106;
+	ccToSoundParam[107] = params::LOCAL_ENV_3_DECAY;
+	soundParamToCC[params::LOCAL_ENV_3_DECAY] = 107;
+	ccToSoundParam[108] = params::LOCAL_ENV_3_SUSTAIN;
+	soundParamToCC[params::LOCAL_ENV_3_SUSTAIN] = 108;
+	ccToSoundParam[109] = params::LOCAL_ENV_3_RELEASE;
+	soundParamToCC[params::LOCAL_ENV_3_RELEASE] = 109;
+	ccToSoundParam[110] = params::GLOBAL_LFO_FREQ_2;
+	soundParamToCC[params::GLOBAL_LFO_FREQ_2] = 110;
+	ccToSoundParam[111] = params::LOCAL_LFO_LOCAL_FREQ_2;
+	soundParamToCC[params::LOCAL_LFO_LOCAL_FREQ_2] = 111;
+	ccToSoundParam[112] = params::UNPATCHED_START + params::UNPATCHED_ARP_SWAP_PROBABILITY;
+	soundParamToCC[params::UNPATCHED_START + params::UNPATCHED_ARP_SWAP_PROBABILITY] = 112;
+	ccToSoundParam[113] = params::UNPATCHED_START + params::UNPATCHED_ARP_GLIDE_PROBABILITY;
+	soundParamToCC[params::UNPATCHED_START + params::UNPATCHED_ARP_GLIDE_PROBABILITY] = 113;
+
+	// GLOBAL PARAMS
+	// NOTE: Here you add the global param, assigning the same CC as its relative sound param
+
+	ccToGlobalParam[3] = params::UNPATCHED_PITCH_ADJUST;
+	globalParamToCC[params::UNPATCHED_PITCH_ADJUST] = 3;
+	ccToGlobalParam[7] = params::UNPATCHED_VOLUME;
+	globalParamToCC[params::UNPATCHED_VOLUME] = 7;
+	ccToGlobalParam[10] = params::UNPATCHED_PAN;
+	globalParamToCC[params::UNPATCHED_PAN] = 10;
+	ccToGlobalParam[16] = params::UNPATCHED_MOD_FX_RATE;
+	globalParamToCC[params::UNPATCHED_MOD_FX_RATE] = 16;
+	ccToGlobalParam[17] = params::UNPATCHED_MOD_FX_FEEDBACK;
+	globalParamToCC[params::UNPATCHED_MOD_FX_FEEDBACK] = 17;
+	ccToGlobalParam[18] = params::UNPATCHED_MOD_FX_OFFSET;
+	globalParamToCC[params::UNPATCHED_MOD_FX_OFFSET] = 18;
+	ccToGlobalParam[20] = params::UNPATCHED_STUTTER_RATE;
+	globalParamToCC[params::UNPATCHED_STUTTER_RATE] = 20;
+	ccToGlobalParam[51] = params::UNPATCHED_ARP_RATE;
+	globalParamToCC[params::UNPATCHED_ARP_RATE] = 51;
+	ccToGlobalParam[52] = params::UNPATCHED_DELAY_AMOUNT;
+	globalParamToCC[params::UNPATCHED_DELAY_AMOUNT] = 52;
+	ccToGlobalParam[53] = params::UNPATCHED_DELAY_RATE;
+	globalParamToCC[params::UNPATCHED_DELAY_RATE] = 53;
+	ccToGlobalParam[60] = params::UNPATCHED_SIDECHAIN_SHAPE;
+	globalParamToCC[params::UNPATCHED_SIDECHAIN_SHAPE] = 60;
+	ccToGlobalParam[61] = params::UNPATCHED_SIDECHAIN_VOLUME;
+	globalParamToCC[params::UNPATCHED_SIDECHAIN_VOLUME] = 61;
+	ccToGlobalParam[62] = params::UNPATCHED_BITCRUSHING;
+	globalParamToCC[params::UNPATCHED_BITCRUSHING] = 62;
+	ccToGlobalParam[63] = params::UNPATCHED_SAMPLE_RATE_REDUCTION;
+	globalParamToCC[params::UNPATCHED_SAMPLE_RATE_REDUCTION] = 63;
+	ccToGlobalParam[70] = params::UNPATCHED_LPF_MORPH;
+	globalParamToCC[params::UNPATCHED_LPF_MORPH] = 70;
+	ccToGlobalParam[71] = params::UNPATCHED_LPF_RES;
+	globalParamToCC[params::UNPATCHED_LPF_RES] = 71;
+	ccToGlobalParam[74] = params::UNPATCHED_LPF_FREQ;
+	globalParamToCC[params::UNPATCHED_LPF_FREQ] = 74;
+	ccToGlobalParam[81] = params::UNPATCHED_HPF_FREQ;
+	globalParamToCC[params::UNPATCHED_HPF_FREQ] = 81;
+	ccToGlobalParam[82] = params::UNPATCHED_HPF_RES;
+	globalParamToCC[params::UNPATCHED_HPF_RES] = 82;
+	ccToGlobalParam[83] = params::UNPATCHED_HPF_MORPH;
+	globalParamToCC[params::UNPATCHED_HPF_MORPH] = 83;
+	ccToGlobalParam[84] = params::UNPATCHED_BASS_FREQ;
+	globalParamToCC[params::UNPATCHED_BASS_FREQ] = 74;
+	ccToGlobalParam[85] = params::UNPATCHED_TREBLE_FREQ;
+	globalParamToCC[params::UNPATCHED_TREBLE_FREQ] = 81;
+	ccToGlobalParam[86] = params::UNPATCHED_BASS;
+	globalParamToCC[params::UNPATCHED_BASS] = 71;
+	ccToGlobalParam[87] = params::UNPATCHED_TREBLE;
+	globalParamToCC[params::UNPATCHED_TREBLE] = 82;
+	ccToGlobalParam[91] = params::UNPATCHED_REVERB_SEND_AMOUNT;
+	globalParamToCC[params::UNPATCHED_REVERB_SEND_AMOUNT] = 91;
+	ccToGlobalParam[93] = params::UNPATCHED_MOD_FX_DEPTH;
+	globalParamToCC[params::UNPATCHED_MOD_FX_DEPTH] = 93;
+}
+
+/// checks to see if there is an active clip for the current context
+/// cases where there is an active clip:
+/// 1) pressing and holding a clip pad in arranger view, song row view, song grid view
+/// 2) pressing and holding the audition pad of a row in arranger view and in
+///	   arranger performance view, arranger automation view
+/// 3) entering a clip or previousy held a clip
+Clip* MidiFollow::getSelectedOrActiveClip() {
+	Clip* clip = nullptr;
+
+	clip = getSelectedClip();
+
+	// if the clip is null, it means you're in a song view and you aren't holding a clip
+	// in that case, we want to control the active clip
+	if (!clip) {
+		clip = getCurrentClip();
+		if (clip) {
+			Output* output = clip->output;
+			if (output) {
+				clip = output->getActiveClip();
+			}
+		}
+	}
+
+	return clip;
+}
+
+/// see if you are pressing and holding a clip in arranger view, song row view, song grid view
+/// see if you are pressing and holding audition pad in arranger view, arranger perf view, or
+/// arranger automation view
+/// if you're in a clip, this will return that clip
+Clip* MidiFollow::getSelectedClip() {
+	Clip* clip = nullptr;
+
+	RootUI* rootUI = getRootUI();
+	UIType uiType = UIType::NONE;
+	if (rootUI) {
+		uiType = rootUI->getUIType();
+	}
+
+	switch (uiType) {
+	case UIType::SESSION:
+		// if you're in session view, check if you're pressing a clip to control that clip
+		clip = sessionView.getClipForLayout();
+		break;
+	case UIType::ARRANGER:
+		clip = arrangerView.getClipForSelection();
+		break;
+	case UIType::PERFORMANCE:
+		// if you're in the arranger performance view, check if you're holding audition pad
+		if (currentSong->lastClipInstanceEnteredStartPos != -1) {
+			clip = arrangerView.getClipForSelection();
+		}
+		break;
+	case UIType::AUTOMATION:
+		// if you're in the arranger automation view, check if you're holding audition pad
+		if (automationView.onArrangerView) {
+			clip = arrangerView.getClipForSelection();
+			break;
+		}
+		[[fallthrough]]; // you're in automation clip view
+	default:             // if you're in a clip view, then return the current clip
+		clip = getCurrentClip();
+	}
+
+	return clip;
+}
+
+/// returns activeClip for the selected output
+/// special case for note and performance data where you want to let notes,
+/// midi modulation sources (e.g. mod wheel), and MPE through to the active clip
+Clip* MidiFollow::getActiveClip(ModelStack* modelStack) {
+	// If you have an output for which no clip is active,
+	// when auditioning a clip for that output,
+	// the active clip for that output should be set to the current clip.
+	Clip* currentClip = getCurrentClip();
+	if (currentClip && (currentClip->type == ClipType::INSTRUMENT)) {
+		if (currentClip->output) {
+			InstrumentClipMinder::makeCurrentClipActiveOnInstrumentIfPossible(modelStack);
+			return currentClip->output->getActiveClip();
+		}
+	}
+	return nullptr;
+}
+
+/// used to forward midi messages to specific tracks
+const size_t MidiFollow::getTrackCount() const {
+	size_t count = 0;
+	Output* currentTrack = currentSong->firstOutput;
+	while (currentTrack != nullptr) {
+		if (currentTrack->getActiveClip() != nullptr) {
+			++count;
+		}
+		currentTrack = currentTrack->next;
+	}
+
+	return count;
+}
+
+/// used to forward midi messages to specific tracks
+Output* MidiFollow::getTrackFromIndex(uint32_t track_index, uint32_t maxTrack) {
+	uint32_t count = 0;
+	Output* currentTrack = currentSong->firstOutput;
+	while (currentTrack != nullptr) {
+		if (currentTrack->getActiveClip() != nullptr) {
+			if (((maxTrack - 1) - count) == track_index) {
+				return currentTrack;
+			}
+
+			++count;
+		}
+		currentTrack = currentTrack->next;
+	}
+
+	return nullptr;
+}
+
+/// based on the current context, as determined by clip returned from the getSelectedClip function
+/// obtain the modelStackWithParam for that context and return it so it can be used by midi follow
+ModelStackWithAutoParam*
+MidiFollow::getModelStackWithParam(ModelStackWithTimelineCounter* modelStackWithTimelineCounter, Clip* clip,
+                                   int32_t soundParamId, int32_t globalParamId, bool displayError) {
+	ModelStackWithAutoParam* modelStackWithParam = nullptr;
+
+	// non-null clip means you're dealing with the clip context
+	if (clip) {
+		if (modelStackWithTimelineCounter) {
+			modelStackWithParam =
+			    getModelStackWithParamForClip(modelStackWithTimelineCounter, clip, soundParamId, globalParamId);
+		}
+	}
+
+	if (displayError && (!modelStackWithParam || !modelStackWithParam->autoParam)) {
+		displayParamControlError(soundParamId, globalParamId);
+	}
+
+	return modelStackWithParam;
+}
+
+ModelStackWithAutoParam*
+MidiFollow::getModelStackWithParamForClip(ModelStackWithTimelineCounter* modelStackWithTimelineCounter, Clip* clip,
+                                          int32_t soundParamId, int32_t globalParamId) {
+	ModelStackWithAutoParam* modelStackWithParam = nullptr;
+	OutputType outputType = clip->output->type;
+
+	switch (outputType) {
+	case OutputType::SYNTH:
+		modelStackWithParam =
+		    getModelStackWithParamForSynthClip(modelStackWithTimelineCounter, clip, soundParamId, globalParamId);
+		break;
+	case OutputType::KIT:
+		modelStackWithParam =
+		    getModelStackWithParamForKitClip(modelStackWithTimelineCounter, clip, soundParamId, globalParamId);
+		break;
+	case OutputType::AUDIO:
+		modelStackWithParam =
+		    getModelStackWithParamForAudioClip(modelStackWithTimelineCounter, clip, soundParamId, globalParamId);
+		break;
+	// explicit fallthrough cases
+	case OutputType::CV:
+	case OutputType::MIDI_OUT:
+	case OutputType::NONE:;
+	}
+
+	return modelStackWithParam;
+}
+
+ModelStackWithAutoParam*
+MidiFollow::getModelStackWithParamForSynthClip(ModelStackWithTimelineCounter* modelStackWithTimelineCounter, Clip* clip,
+                                               int32_t soundParamId, int32_t globalParamId) {
+	ModelStackWithAutoParam* modelStackWithParam = nullptr;
+	params::Kind paramKind = params::Kind::NONE;
+	int32_t paramID = PARAM_ID_NONE;
+
+	if (soundParamId != PARAM_ID_NONE && soundParamId < params::UNPATCHED_START) {
+		paramKind = params::Kind::PATCHED;
+		paramID = soundParamId;
+	}
+	else if (soundParamId != PARAM_ID_NONE && soundParamId >= params::UNPATCHED_START) {
+		paramKind = params::Kind::UNPATCHED_SOUND;
+		paramID = soundParamId - params::UNPATCHED_START;
+	}
+	if ((paramKind != params::Kind::NONE) && (paramID != PARAM_ID_NONE)) {
+		// Note: useMenuContext parameter will always be false for MidiFollow
+		modelStackWithParam =
+		    clip->output->getModelStackWithParam(modelStackWithTimelineCounter, clip, paramID, paramKind, true, false);
+	}
+
+	return modelStackWithParam;
+}
+
+ModelStackWithAutoParam*
+MidiFollow::getModelStackWithParamForKitClip(ModelStackWithTimelineCounter* modelStackWithTimelineCounter, Clip* clip,
+                                             int32_t soundParamId, int32_t globalParamId) {
+	ModelStackWithAutoParam* modelStackWithParam = nullptr;
+	params::Kind paramKind = params::Kind::NONE;
+	int32_t paramID = PARAM_ID_NONE;
+	InstrumentClip* instrumentClip = (InstrumentClip*)clip;
+
+	if (!instrumentClip->affectEntire) {
+		if (soundParamId != PARAM_ID_NONE && soundParamId < params::UNPATCHED_START) {
+			paramKind = params::Kind::PATCHED;
+			paramID = soundParamId;
+		}
+		else if (soundParamId != PARAM_ID_NONE && soundParamId >= params::UNPATCHED_START) {
+			// don't allow control of Portamento in Kit's
+			if (soundParamId - params::UNPATCHED_START != params::UNPATCHED_PORTAMENTO) {
+				paramKind = params::Kind::UNPATCHED_SOUND;
+				paramID = soundParamId - params::UNPATCHED_START;
+			}
+		}
+	}
+	else {
+		if (globalParamId != PARAM_ID_NONE) {
+			paramKind = params::Kind::UNPATCHED_GLOBAL;
+			paramID = globalParamId;
+		}
+	}
+
+	if ((paramKind != params::Kind::NONE) && (paramID != PARAM_ID_NONE)) {
+		// Note: useMenuContext parameter will always be false for MidiFollow
+		modelStackWithParam = clip->output->getModelStackWithParam(modelStackWithTimelineCounter, clip, paramID,
+		                                                           paramKind, instrumentClip->affectEntire, false);
+	}
+
+	return modelStackWithParam;
+}
+
+ModelStackWithAutoParam*
+MidiFollow::getModelStackWithParamForAudioClip(ModelStackWithTimelineCounter* modelStackWithTimelineCounter, Clip* clip,
+                                               int32_t soundParamId, int32_t globalParamId) {
+	ModelStackWithAutoParam* modelStackWithParam = nullptr;
+	params::Kind paramKind = params::Kind::UNPATCHED_GLOBAL;
+	int32_t paramID = globalParamId;
+
+	if (paramID != PARAM_ID_NONE) {
+		// Note: useMenuContext parameter will always be false for MidiFollow
+		modelStackWithParam =
+		    clip->output->getModelStackWithParam(modelStackWithTimelineCounter, clip, paramID, paramKind, true, false);
+	}
+
+	return modelStackWithParam;
+}
+
+void MidiFollow::displayParamControlError(int32_t soundParamId, int32_t globalParamId) {
+	params::Kind paramKind = params::Kind::NONE;
+	int32_t paramID = PARAM_ID_NONE;
+
+	if (soundParamId != PARAM_ID_NONE && soundParamId < params::UNPATCHED_START) {
+		paramKind = params::Kind::PATCHED;
+		paramID = soundParamId;
+	}
+	else if (soundParamId != PARAM_ID_NONE && soundParamId >= params::UNPATCHED_START) {
+		paramKind = params::Kind::UNPATCHED_SOUND;
+		paramID = soundParamId - params::UNPATCHED_START;
+	}
+	else if (globalParamId != PARAM_ID_NONE) {
+		paramKind = params::Kind::UNPATCHED_GLOBAL;
+		paramID = globalParamId;
+	}
+
+	if (paramID != PARAM_ID_NONE) {
+		if (display->haveOLED()) {
+			DEF_STACK_STRING_BUF(popupMsg, 40);
+
+			const char* name = getParamDisplayName(paramKind, paramID);
+			if (name != l10n::get(l10n::String::STRING_FOR_NONE)) {
+				popupMsg.append("Can't control: \n");
+				popupMsg.append(name);
+			}
+			display->displayPopup(popupMsg.c_str());
+		}
+		else {
+			display->displayPopup(l10n::get(l10n::String::STRING_FOR_PARAMETER_NOT_APPLICABLE));
+		}
+	}
+}
+
+/// a parameter can be learned to one cc at a time
+/// for a given parameter, find and return the cc that has been learned (if any)
+/// for the current midi follow controllable context
+/// if no cc is found, then MIDI_CC_NONE (255) is returned
+int32_t MidiFollow::getCCFromParam(params::Kind paramKind, int32_t paramID) {
+	// audio clip or kit with affect entire enabled
+	if (isGlobalEffectableContext()) {
+		if (paramKind == params::Kind::UNPATCHED_GLOBAL) {
+			return globalParamToCC[paramID];
+		}
+	}
+	// synth clip or kit row
+	else {
+		if (paramKind == params::Kind::PATCHED) {
+			return soundParamToCC[paramID];
+		}
+		else if (paramKind == params::Kind::UNPATCHED_SOUND) {
+			return soundParamToCC[params::UNPATCHED_START + paramID];
+		}
+	}
+	return MIDI_CC_NONE;
+}
+
+/// Check if midi follow is controlling the global effectable context
+/// if so, we should only be controlling the global effectable parameters
+bool MidiFollow::isGlobalEffectableContext() {
+	// obtain clip for active context (for params that's only for the active mod controllable stack)
+	Clip* clip = getSelectedOrActiveClip();
+	if (clip != nullptr) {
+		// audio clips are always global effectable
+		if (clip->output->type == OutputType::AUDIO) {
+			return true;
+		}
+		// kits may be global effectable depending on affect entire status
+		else if (clip->output->type == OutputType::KIT) {
+			bool affectEntire = ((InstrumentClip*)clip)->affectEntire;
+			// if affect entire is enabled, then midi follow controls global effectable params
+			if (affectEntire) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+/// used to store the clip's for each note received so that note off's can be sent to the right clip
+PLACE_SDRAM_DATA Clip* clipForLastNoteReceived[kMaxMIDIValue + 1] = {0};
+
+/// initializes the clipForLastNoteReceived array
+/// called when swapping songs to make sure that you aren't using clips from the old song
+void MidiFollow::clearStoredClips() {
+	for (int32_t i = 0; i <= 127; i++) {
+		clipForLastNoteReceived[i] = nullptr;
+	}
+}
+
+/// removes a specific clip pointer from the clipForLastNoteReceived array
+/// if a clip is deleted, it should be removed from this array to ensure note off's don't get sent
+/// to delete clips
+void MidiFollow::removeClip(Clip* clip) {
+	for (int32_t i = 0; i <= 127; i++) {
+		if (clipForLastNoteReceived[i] == clip) {
+			clipForLastNoteReceived[i] = nullptr;
+		}
+	}
+}
+
+/// called from playback handler
+/// determines whether a note message received is midi follow relevant
+/// and should be routed to the active context or a specific track for further processing
+void MidiFollow::noteMessageReceived(MIDICable& cable, bool on, int32_t channel, int32_t note, int32_t velocity,
+                                     bool* doingMidiThru, bool shouldRecordNotesNowNow, ModelStack* modelStack) {
+	// first try to process note received through regular midi follow channels (A/B/C) against the selected / active
+	// clip
+	Output* selected_track = noteMessageReceivedForSelectedOrActiveClip(
+	    cable, on, channel, note, velocity, doingMidiThru, shouldRecordNotesNowNow, modelStack);
+
+	// logic for forwarding message to specific track
+	// get number of tracks
+	auto track_count = getTrackCount();
+
+	if (track_count != 0) {
+		// iterate through all the instruments
+		for (int32_t track_index = 0; track_index < track_count; ++track_index) {
+			// ignore track outputs > maximum number of midi follow track channels we have
+			if (track_index >= kNumMIDIFollowChannelTrackTypes) {
+				break;
+			}
+			Output* track = getTrackFromIndex(track_index, track_count);
+			// if track is not null and we did not already send message to this track above
+			if (track != nullptr && track != selected_track) {
+				// next try to process note received through track midi follow channels (Track1-16)
+				noteMessageReceivedForSpecificTrack(cable, on, channel, note, velocity, doingMidiThru,
+				                                    shouldRecordNotesNowNow, modelStack, track, track_index);
+			}
+		}
+	}
+}
+
+/// determines whether a midi note received is midi follow relevant
+/// and should be routed to the active context for further processing
+Output* MidiFollow::noteMessageReceivedForSelectedOrActiveClip(MIDICable& cable, bool on, int32_t channel, int32_t note,
+                                                               int32_t velocity, bool* doingMidiThru,
+                                                               bool shouldRecordNotesNowNow, ModelStack* modelStack) {
+	Output* selected_track = nullptr;
+
+	MIDIMatchType match = checkMidiFollowMatch(cable, channel);
+	if (match != MIDIMatchType::NO_MATCH) {
+		if (note >= 0 && note <= 127) {
+			Clip* clip;
+			if (on) {
+				clip = getActiveClip(modelStack);
+			}
+			else {
+				// for note off's, see if a note on message was previously sent so you can
+				// direct the note off to the right place
+				clip = clipForLastNoteReceived[note];
+			}
+
+			selected_track = sendNoteToClip(cable, clip, match, on, channel, note, velocity, doingMidiThru,
+			                                shouldRecordNotesNowNow, modelStack);
+		}
+		// all notes off
+		else if (note == ALL_NOTES_OFF) {
+			for (int32_t i = 0; i <= 127; i++) {
+				if (clipForLastNoteReceived[i]) {
+					selected_track = sendNoteToClip(cable, clipForLastNoteReceived[i], match, on, channel, i, velocity,
+					                                doingMidiThru, shouldRecordNotesNowNow, modelStack);
+				}
+			}
+		}
+	}
+	return selected_track;
+}
+
+/// determines whether a midi note received is midi follow relevant
+/// and should be routed to a specific track for further processing
+void MidiFollow::noteMessageReceivedForSpecificTrack(MIDICable& cable, bool on, int32_t channel, int32_t note,
+                                                     int32_t velocity, bool* doingMidiThru,
+                                                     bool shouldRecordNotesNowNow, ModelStack* modelStack,
+                                                     Output* specific_track, int32_t specific_track_index) {
+	MIDIMatchType match = checkMidiFollowMatchForSpecificTrack(cable, channel, specific_track_index);
+	if (match != MIDIMatchType::NO_MATCH) {
+		// obtain active clip for specific track
+		Clip* clip = specific_track->getActiveClip();
+
+		if (note >= 0 && note <= 127) {
+			sendNoteToClip(cable, clip, match, on, channel, note, velocity, doingMidiThru, shouldRecordNotesNowNow,
+			               modelStack, false);
+		}
+		// all notes off
+		else if (note == ALL_NOTES_OFF) {
+			for (int32_t i = 0; i <= 127; i++) {
+				sendNoteToClip(cable, clip, match, on, channel, i, velocity, doingMidiThru, shouldRecordNotesNowNow,
+				               modelStack, false);
+			}
+		}
+	}
+}
+
+Output* MidiFollow::sendNoteToClip(MIDICable& cable, Clip* clip, MIDIMatchType match, bool on, int32_t channel,
+                                   int32_t note, int32_t velocity, bool* doingMidiThru, bool shouldRecordNotesNowNow,
+                                   ModelStack* modelStack, bool updateClipForLastNoteReceived) {
+	Output* selected_track = nullptr;
+
+	// Only send if not muted - but let note-offs through always, for safety
+	if (clip && (!on || currentSong->isOutputActiveInArrangement(clip->output))) {
+		selected_track = clip->output;
+
+		// ensure output is a kit or melodic instrument
+		if (clip->type != ClipType::INSTRUMENT) {
+			// if it's an audio clip, return the track so it can be skipped by specific track processing
+			return selected_track;
+		}
+
+		ModelStackWithTimelineCounter* modelStackWithTimelineCounter = modelStack->addTimelineCounter(clip);
+		if (modelStackWithTimelineCounter) {
+			// Definitely don't record if muted in arrangement
+			bool shouldRecordNotes = shouldRecordNotesNowNow && currentSong->isOutputActiveInArrangement(clip->output);
+			if (clip->output->type == OutputType::KIT) {
+				auto kit = (Kit*)clip->output;
+				kit->receivedNoteForKit(modelStackWithTimelineCounter, cable, on, channel,
+				                        note - midiEngine.midiFollowKitRootNote, velocity, shouldRecordNotes,
+				                        doingMidiThru, (InstrumentClip*)clip);
+			}
+			else {
+				MelodicInstrument* melodicInstrument = (MelodicInstrument*)clip->output;
+				melodicInstrument->receivedNote(modelStackWithTimelineCounter, cable, on, channel, match, note,
+				                                velocity, shouldRecordNotes, doingMidiThru);
+			}
+			// don't update if we're sending note to a specific track
+			if (updateClipForLastNoteReceived) {
+				if (on) {
+					clipForLastNoteReceived[note] = clip;
+				}
+				else {
+					if (note >= 0 && note <= 127) {
+						clipForLastNoteReceived[note] = nullptr;
+					}
+				}
+			}
+		}
+	}
+	return selected_track;
+}
+
+/// called from playback handler
+/// determines whether a midi cc received is midi follow relevant
+/// and should be routed to the active context or a specific track for further processing
+void MidiFollow::midiCCReceived(MIDICable& cable, uint8_t channel, uint8_t ccNumber, uint8_t ccValue,
+                                bool* doingMidiThru, ModelStack* modelStack) {
+	// first try to process cc received through regular midi follow channels (A/B/C) against the selected / active clip
+	Output* selected_track =
+	    midiCCReceivedForSelectedOrActiveClip(cable, channel, ccNumber, ccValue, doingMidiThru, modelStack);
+
+	// logic for forwarding message to specific track
+	// get number of tracks
+	auto track_count = getTrackCount();
+
+	if (track_count != 0) {
+		// iterate through all the instruments
+		for (int32_t track_index = 0; track_index < track_count; ++track_index) {
+			// ignore track outputs > maximum number of midi follow track channels we have
+			if (track_index >= kNumMIDIFollowChannelTrackTypes) {
+				break;
+			}
+			Output* track = getTrackFromIndex(track_index, track_count);
+			// if track is not null and we did not already send message to this track above
+			if (track != nullptr && track != selected_track) {
+				// next try to process cc received through track midi follow channels (Track1-16)
+				midiCCReceivedForSpecificTrack(cable, channel, ccNumber, ccValue, doingMidiThru, modelStack, track,
+				                               track_index);
+			}
+		}
+	}
+}
+
+/// determines whether a midi cc received is midi follow relevant
+/// and should be routed to the active context for further processing
+Output* MidiFollow::midiCCReceivedForSelectedOrActiveClip(MIDICable& cable, uint8_t channel, uint8_t ccNumber,
+                                                          uint8_t ccValue, bool* doingMidiThru,
+                                                          ModelStack* modelStack) {
+	Output* selected_track = nullptr;
+
+	MIDIMatchType match = checkMidiFollowMatch(cable, channel);
+	if (match != MIDIMatchType::NO_MATCH) {
+		// obtain clip for active context (for params that's only for the active mod controllable stack)
+		Clip* clip = getSelectedOrActiveClip();
+
+		bool isMIDIClip = false;
+		bool isCVClip = false;
+		if (clip) {
+			if (clip->output->type == OutputType::MIDI_OUT) {
+				isMIDIClip = true;
+			}
+			if (clip->output->type == OutputType::CV) {
+				isCVClip = true;
+			}
+			selected_track = clip->output;
+		}
+
+		// don't offer to handleReceivedCC if it's a MIDI or CV Clip
+		// this is because this function is used to control internal deluge parameters only (patched, unpatched)
+		// midi/cv clip cc parameters are handled below in the offerReceivedCCToMelodicInstrument function
+		if (clip && !isMIDIClip && !isCVClip
+		    && (match == MIDIMatchType::MPE_MASTER || match == MIDIMatchType::CHANNEL)) {
+			// if midi follow feedback and feedback filter is enabled,
+			// check time elapsed since last midi cc was sent with midi feedback for this same ccNumber
+			// if it was greater or equal than 1 second ago, allow received midi cc to go through
+			// this helps avoid additional processing of midi cc's received
+			if (!isFeedbackEnabled()
+			    || (isFeedbackEnabled()
+			        && (!midiEngine.midiFollowFeedbackFilter
+			            || (midiEngine.midiFollowFeedbackFilter
+			                && ((AudioEngine::audioSampleTimer - timeLastCCSent[ccNumber]) >= kSampleRate))))) {
+				// setup model stack for the active context
+				if (modelStack) {
+					auto modelStackWithTimelineCounter = modelStack->addTimelineCounter(clip);
+
+					if (modelStackWithTimelineCounter) {
+						// See if it's learned to a parameter
+						handleReceivedCC(cable, *modelStackWithTimelineCounter, clip, ccNumber, ccValue);
+					}
+				}
+			}
+		}
+		// for these cc's, always use the active clip for the output selected
+		clip = getActiveClip(modelStack);
+		// these cc's are only relevant for instrument clips
+		if (clip && clip->type == ClipType::INSTRUMENT) {
+			ModelStackWithTimelineCounter* modelStackWithTimelineCounter = modelStack->addTimelineCounter(clip);
+			if (modelStackWithTimelineCounter) {
+				if (clip->output->type == OutputType::KIT) {
+					Kit* kit = (Kit*)clip->output;
+					kit->receivedCCForKit(modelStackWithTimelineCounter, cable, match, channel, ccNumber, ccValue,
+					                      doingMidiThru, clip);
+				}
+				else {
+					MelodicInstrument* melodicInstrument = (MelodicInstrument*)clip->output;
+					melodicInstrument->receivedCC(modelStackWithTimelineCounter, cable, match, channel, ccNumber,
+					                              ccValue, doingMidiThru);
+				}
+			}
+		}
+	}
+	return selected_track;
+}
+
+/// determines whether a midi cc received is midi follow relevant
+/// and should be routed to a specific track for further processing
+void MidiFollow::midiCCReceivedForSpecificTrack(MIDICable& cable, uint8_t channel, uint8_t ccNumber, uint8_t ccValue,
+                                                bool* doingMidiThru, ModelStack* modelStack, Output* specific_track,
+                                                int32_t specific_track_index) {
+	MIDIMatchType match = checkMidiFollowMatchForSpecificTrack(cable, channel, specific_track_index);
+	if (match != MIDIMatchType::NO_MATCH) {
+		// obtain active clip for specific track
+		Clip* clip = specific_track->getActiveClip();
+
+		bool isMIDIClip = false;
+		bool isCVClip = false;
+
+		if (clip != nullptr) {
+			if (ccNumber == MIDI_CC_MUTE) {
+				if (ccValue > 0) {
+					session.toggleClipStatus(clip, nullptr, Buttons::isShiftButtonPressed(), kMIDIKeyInputLatency);
+				}
+				return;
+			}
+			else if (ccNumber == MIDI_CC_SOLO) {
+				if (ccValue > 0) {
+					session.soloClipAction(clip, Buttons::isShiftButtonPressed(), kMIDIKeyInputLatency);
+				}
+				return;
+			}
+			else if (specific_track->type == OutputType::MIDI_OUT) {
+				isMIDIClip = true;
+			}
+			else if (specific_track->type == OutputType::CV) {
+				isCVClip = true;
+			}
+
+			// don't offer to handleReceivedCC if it's a MIDI or CV Clip
+			// this is because this function is used to control internal deluge parameters only (patched, unpatched)
+			// midi/cv clip cc parameters are handled below in the offerReceivedCCToMelodicInstrument function
+			if (!isMIDIClip && !isCVClip && (match == MIDIMatchType::MPE_MASTER || match == MIDIMatchType::CHANNEL)) {
+				// if midi follow feedback and feedback filter is enabled,
+				// check time elapsed since last midi cc was sent with midi feedback for this same ccNumber
+				// if it was greater or equal than 1 second ago, allow received midi cc to go through
+				// this helps avoid additional processing of midi cc's received
+				if (!isFeedbackEnabled()
+				    || (isFeedbackEnabled()
+				        && (!midiEngine.midiFollowFeedbackFilter
+				            || (midiEngine.midiFollowFeedbackFilter
+				                && ((AudioEngine::audioSampleTimer - timeLastCCSent[ccNumber]) >= kSampleRate))))) {
+					// setup model stack for the active context
+					if (modelStack) {
+						auto modelStackWithTimelineCounter = modelStack->addTimelineCounter(clip);
+
+						if (modelStackWithTimelineCounter) {
+							// See if it's learned to a parameter
+							handleReceivedCC(cable, *modelStackWithTimelineCounter, clip, ccNumber, ccValue);
+						}
+					}
+				}
+			}
+			if (clip->type == ClipType::INSTRUMENT) {
+				ModelStackWithTimelineCounter* modelStackWithTimelineCounter = modelStack->addTimelineCounter(clip);
+				if (modelStackWithTimelineCounter) {
+					if (specific_track->type == OutputType::KIT) {
+						Kit* kit = (Kit*)specific_track;
+						kit->receivedCCForKit(modelStackWithTimelineCounter, cable, match, channel, ccNumber, ccValue,
+						                      doingMidiThru, clip);
+					}
+					else {
+						MelodicInstrument* melodicInstrument = (MelodicInstrument*)specific_track;
+						melodicInstrument->receivedCC(modelStackWithTimelineCounter, cable, match, channel, ccNumber,
+						                              ccValue, doingMidiThru);
+					}
+				}
+			}
+		}
+	}
+}
+
+/// checks if the ccNumber received has been learned to any parameters in midi learning view
+/// if the cc has been learned, it sets the new value for that parameter
+/// this function works by first checking the active context to see if there is an active clip
+/// to determine if the cc intends to control a song level or clip level parameter
+void MidiFollow::handleReceivedCC(MIDICable& cable, ModelStackWithTimelineCounter& modelStackWithTimelineCounter,
+                                  Clip* clip, int32_t ccNumber, int32_t ccValue) {
+
+	int32_t modPos = 0;
+	int32_t modLength = 0;
+	bool isStepEditing = false;
+
+	if (modelStackWithTimelineCounter.timelineCounterIsSet()) {
+		TimelineCounter* timelineCounter = modelStackWithTimelineCounter.getTimelineCounter();
+
+		// Only if this exact TimelineCounter is having automation step-edited, we can set the value for just a
+		// region.
+		if (view.modLength && timelineCounter == view.activeModControllableModelStack.getTimelineCounterAllowNull()) {
+			modPos = view.modPos;
+			modLength = view.modLength;
+			isStepEditing = true;
+		}
+
+		timelineCounter->possiblyCloneForArrangementRecording(&modelStackWithTimelineCounter);
+	}
+
+	// directly access the parameter from the CC number
+	uint8_t soundParamId = ccToSoundParam[ccNumber];
+	uint8_t globalParamId = ccToGlobalParam[ccNumber];
+	if (soundParamId == PARAM_ID_NONE && globalParamId == PARAM_ID_NONE) {
+		// Abort
+		return;
+	}
+
+	ModelStackWithAutoParam* modelStackWithParam = getModelStackWithParam(
+	    &modelStackWithTimelineCounter, clip, soundParamId, globalParamId, midiEngine.midiFollowDisplayParam);
+	// check if model stack is valid
+	if (modelStackWithParam && modelStackWithParam->autoParam) {
+		int32_t currentValue;
+
+		// get current value
+		if (isStepEditing) {
+			currentValue = modelStackWithParam->autoParam->getValuePossiblyAtPos(modPos, modelStackWithParam);
+		}
+		else {
+			currentValue = modelStackWithParam->autoParam->getCurrentValue();
+		}
+
+		// convert current value to knobPos to compare to cc value being received
+		int32_t knobPos = modelStackWithParam->paramCollection->paramValueToKnobPos(currentValue, modelStackWithParam);
+
+		// calculate new knob position based on cc value received and deluge current value
+		int32_t newKnobPos =
+		    MidiTakeover::calculateKnobPos(cable, knobPos, ccValue, nullptr, true, ccNumber, isStepEditing);
+
+		// is the cc being received for the same value as the current knob pos? If so, do nothing
+		if (newKnobPos != knobPos) {
+			// Convert the New Knob Position to a Parameter Value
+			int32_t newValue =
+			    modelStackWithParam->paramCollection->knobPosToParamValue(newKnobPos, modelStackWithParam);
+
+			// Set the new Parameter Value for the MIDI Learned Parameter
+			modelStackWithParam->autoParam->setValuePossiblyForRegion(newValue, modelStackWithParam, modPos, modLength);
+
+			// check if you're currently editing the same learned param in automation view or
+			// performance view if so, you will need to refresh the automation editor grid or the
+			// performance view
+			bool editingParamInAutomationOrPerformanceView = false;
+			RootUI* rootUI = getRootUI();
+			if (rootUI == &automationView || rootUI == &performanceView) {
+				int32_t id = modelStackWithParam->paramId;
+				params::Kind kind = modelStackWithParam->paramCollection->getParamKind();
+
+				if (rootUI == &automationView) {
+					// pass the current clip because you want to check that you're editing the param
+					// for the same clip active in automation view
+					editingParamInAutomationOrPerformanceView =
+					    automationView.possiblyRefreshAutomationEditorGrid(clip, kind, id);
+				}
+				else {
+					editingParamInAutomationOrPerformanceView =
+					    performanceView.possiblyRefreshPerformanceViewDisplay(kind, id, newKnobPos);
+				}
+			}
+
+			// check if you should display name of the parameter that was changed and the value that
+			// has been set if you're in the automation view editor or performance view non-editing
+			// mode don't display popup if you're currently editing the same param
+			if (midiEngine.midiFollowDisplayParam && !editingParamInAutomationOrPerformanceView) {
+				params::Kind kind = modelStackWithParam->paramCollection->getParamKind();
+				view.displayModEncoderValuePopup(kind, modelStackWithParam->paramId, newKnobPos);
+			}
+		}
+	}
+}
+
+MIDIFollowChannelType MidiFollow::getChannelTypeForTrackFeedback() {
+	// obtain clip for active context
+	Clip* clip = getSelectedOrActiveClip();
+
+	// check if clip is valid
+	if (clip) {
+		// get track
+		Output* selected_track = clip->output;
+
+		// get number of tracks
+		auto track_count = getTrackCount();
+
+		if (track_count != 0) {
+			// iterate through all the instruments
+			for (int32_t track_index = 0; track_index < track_count; ++track_index) {
+				// ignore track outputs > maximum number of midi follow track channels we have
+				if (track_index >= kNumMIDIFollowChannelTrackTypes) {
+					break;
+				}
+				Output* track = getTrackFromIndex(track_index, track_count);
+				// if track is not null and track is the selected track
+				if (track != nullptr && track == selected_track) {
+					auto i = kNumMIDIFollowChannelTypes + track_index;
+					if (i < kNumMIDIFollowChannelTypesIncludingTracks) {
+						return static_cast<MIDIFollowChannelType>(i);
+					}
+				}
+			}
+		}
+	}
+	return MIDIFollowChannelType::NONE;
+}
+
+/// Add a configured MIDI Follow channel type to the feedback target list.
+/// Returns false when the type is not a real feedback target, has not been learned, is a duplicate MIDI channel,
+/// or would exceed the fixed feedback target list.
+bool MidiFollow::addChannelTypeForFeedback(FeedbackChannelTypes& feedbackChannelTypes, size_t& numChannelTypes,
+                                           MIDIFollowChannelType feedbackChannelType) {
+	// Track feedback returns NONE when the selected clip does not belong to a configured track channel.
+	if (feedbackChannelType == MIDIFollowChannelType::NONE) {
+		return false;
+	}
+
+	auto channelTypeIndex = util::to_underlying(feedbackChannelType);
+	// Only A/B/C and Track1-16 have LearnedMIDI slots.
+	if (channelTypeIndex >= kNumMIDIFollowChannelTypesIncludingTracks) {
+		return false;
+	}
+
+	LearnedMIDI& midiInput = midiEngine.midiFollowChannelType[channelTypeIndex];
+	// A channel type with no learned MIDI channel cannot receive feedback.
+	if (midiInput.channelOrZone == MIDI_CHANNEL_NONE) {
+		return false;
+	}
+
+	// Combined feedback modes can resolve to the same MIDI channel through Track and A/B/C; send once.
+	for (size_t i = 0; i < numChannelTypes; i++) {
+		LearnedMIDI& existingMidiInput = midiEngine.midiFollowChannelType[util::to_underlying(feedbackChannelTypes[i])];
+		if (existingMidiInput.channelOrZone == midiInput.channelOrZone) {
+			return false;
+		}
+	}
+
+	// Keep writes inside the fixed-size feedback target buffer.
+	if (numChannelTypes >= feedbackChannelTypes.size()) {
+		return false;
+	}
+
+	feedbackChannelTypes[numChannelTypes] = feedbackChannelType;
+	numChannelTypes++;
+	return true;
+}
+
+/// Resolve the configured MIDI Follow feedback mode into one or more learned channel types.
+/// Combined Track + A/B/C modes add Track first, then the regular channel, so duplicate gating happens in order.
+size_t MidiFollow::getChannelTypesForFeedback(FeedbackChannelTypes& feedbackChannelTypes) {
+	feedbackChannelTypes.fill(MIDIFollowChannelType::NONE);
+
+	size_t numChannelTypes = 0;
+	MIDIFollowFeedbackChannelType feedbackChannelType = midiEngine.midiFollowFeedbackChannelType;
+
+	switch (feedbackChannelType) {
+	case MIDIFollowFeedbackChannelType::A:
+		// Feedback is sent only to regular follow channel A when it is configured.
+		addChannelTypeForFeedback(feedbackChannelTypes, numChannelTypes, MIDIFollowChannelType::A);
+		break;
+
+	case MIDIFollowFeedbackChannelType::B:
+		// Feedback is sent only to regular follow channel B when it is configured.
+		addChannelTypeForFeedback(feedbackChannelTypes, numChannelTypes, MIDIFollowChannelType::B);
+		break;
+
+	case MIDIFollowFeedbackChannelType::C:
+		// Feedback is sent only to regular follow channel C when it is configured.
+		addChannelTypeForFeedback(feedbackChannelTypes, numChannelTypes, MIDIFollowChannelType::C);
+		break;
+
+	case MIDIFollowFeedbackChannelType::Track:
+		// Feedback follows the configured track channel for the selected clip.
+		addChannelTypeForFeedback(feedbackChannelTypes, numChannelTypes, getChannelTypeForTrackFeedback());
+		break;
+
+	case MIDIFollowFeedbackChannelType::TrackAndA:
+		// Track feedback has priority; channel A is added only if configured and not the same MIDI channel.
+		addChannelTypeForFeedback(feedbackChannelTypes, numChannelTypes, getChannelTypeForTrackFeedback());
+		addChannelTypeForFeedback(feedbackChannelTypes, numChannelTypes, MIDIFollowChannelType::A);
+		break;
+
+	case MIDIFollowFeedbackChannelType::TrackAndB:
+		// Track feedback has priority; channel B is added only if configured and not the same MIDI channel.
+		addChannelTypeForFeedback(feedbackChannelTypes, numChannelTypes, getChannelTypeForTrackFeedback());
+		addChannelTypeForFeedback(feedbackChannelTypes, numChannelTypes, MIDIFollowChannelType::B);
+		break;
+
+	case MIDIFollowFeedbackChannelType::TrackAndC:
+		// Track feedback has priority; channel C is added only if configured and not the same MIDI channel.
+		addChannelTypeForFeedback(feedbackChannelTypes, numChannelTypes, getChannelTypeForTrackFeedback());
+		addChannelTypeForFeedback(feedbackChannelTypes, numChannelTypes, MIDIFollowChannelType::C);
+		break;
+
+	case MIDIFollowFeedbackChannelType::NONE:
+	case MIDIFollowFeedbackChannelType::INVALID:
+		// Feedback is disabled, or the saved setting was not recognized.
+		break;
+	}
+
+	return numChannelTypes;
+}
+
+/// called when updating the context,
+/// e.g. switching from song to clip, changing instruments presets, peeking a clip in song view
+/// this function:
+/// 1) checks the active context
+/// 2) sets up the model stack for that context
+/// 3) checks what parameters have been learned and obtains the model stack for those params
+/// 4) sends midi feedback of the current parameter value to the cc numbers learned to those parameters
+void MidiFollow::sendCCWithoutModelStackForMidiFollowFeedback(bool isAutomation) {
+	FeedbackChannelTypes feedbackChannelTypes;
+	size_t numChannelTypes = getChannelTypesForFeedback(feedbackChannelTypes);
+	if (numChannelTypes == 0) {
+		return;
+	}
+
+	char modelStackMemory[MODEL_STACK_MAX_SIZE];
+
+	ModelStackWithTimelineCounter* modelStackWithTimelineCounter = nullptr;
+
+	// obtain clip for active context
+	Clip* clip = getSelectedOrActiveClip();
+
+	// setup model stack for the active context
+	if (clip) {
+		ModelStack* modelStack = setupModelStackWithSong(modelStackMemory, currentSong);
+		if (modelStack) {
+			modelStackWithTimelineCounter = modelStack->addTimelineCounter(clip);
+		}
+	}
+
+	// check that model stack is valid
+	if (modelStackWithTimelineCounter) {
+		int32_t modPos = 0;
+		bool isStepEditing = false;
+
+		if (modelStackWithTimelineCounter->timelineCounterIsSet()) {
+			TimelineCounter* timelineCounter = modelStackWithTimelineCounter->getTimelineCounter();
+
+			// Only if this exact TimelineCounter is having automation step-edited, we can send the value for just a
+			// region.
+			if (view.modLength
+			    && timelineCounter == view.activeModControllableModelStack.getTimelineCounterAllowNull()) {
+
+				// don't send automation feedback if you're step editing
+				if (isAutomation) {
+					return;
+				}
+
+				modPos = view.modPos;
+				isStepEditing = true;
+			}
+		}
+
+		// loop through all params to see if any parameters have been learned
+		for (int32_t ccNumber = 0; ccNumber <= kMaxMIDIValue; ccNumber++) {
+			uint8_t soundParamId = ccToSoundParam[ccNumber];
+			uint8_t globalParamId = ccToGlobalParam[ccNumber];
+			// obtain the model stack for the parameter that has been learned
+			ModelStackWithAutoParam* modelStackWithParam =
+			    getModelStackWithParam(modelStackWithTimelineCounter, clip, soundParamId, globalParamId, false);
+			// check that model stack is valid
+			if (modelStackWithParam && modelStackWithParam->autoParam) {
+				if (!isAutomation || (isAutomation && modelStackWithParam->autoParam->isAutomated())) {
+					int32_t currentValue;
+					// obtain current value of the learned parameter
+					if (isStepEditing) {
+						currentValue =
+						    modelStackWithParam->autoParam->getValuePossiblyAtPos(modPos, modelStackWithParam);
+					}
+					else {
+						currentValue = modelStackWithParam->autoParam->getCurrentValue();
+					}
+
+					// convert current value to a knob position
+					int32_t knobPos =
+					    modelStackWithParam->paramCollection->paramValueToKnobPos(currentValue, modelStackWithParam);
+
+					// send midi feedback to the ccNumber learned to the param with the current knob
+					// position
+					sendCCForMidiFollowFeedback(feedbackChannelTypes, numChannelTypes, ccNumber, knobPos);
+				}
+			}
+		}
+	}
+}
+
+/// Resolve the current MIDI Follow feedback configuration, then send this learned CC value to each target.
+/// Called when updating parameter values using mod (gold) encoders or the select encoder in the soundEditor menu.
+/// Also called when updating the context, e.g. switching from song to clip, changing instruments presets, peeking a
+/// clip in song view.
+void MidiFollow::sendCCForMidiFollowFeedback(int32_t ccNumber, int32_t knobPos) {
+	FeedbackChannelTypes feedbackChannelTypes;
+	size_t numChannelTypes = getChannelTypesForFeedback(feedbackChannelTypes);
+	sendCCForMidiFollowFeedback(feedbackChannelTypes, numChannelTypes, ccNumber, knobPos);
+}
+
+/// Send this learned CC value to each resolved feedback target.
+/// The target list is expected to have already been filtered for configured channels and duplicate MIDI channels.
+void MidiFollow::sendCCForMidiFollowFeedback(FeedbackChannelTypes const& feedbackChannelTypes, size_t numChannelTypes,
+                                             int32_t ccNumber, int32_t knobPos) {
+	for (size_t i = 0; i < numChannelTypes; i++) {
+		sendCCForMidiFollowFeedback(feedbackChannelTypes[i], ccNumber, knobPos);
+	}
+}
+
+/// Send this learned CC value to a single MIDI Follow feedback target.
+/// MPE zones send on their master channel while keeping the original channel/zone as the output filter.
+void MidiFollow::sendCCForMidiFollowFeedback(MIDIFollowChannelType feedbackChannelType, int32_t ccNumber,
+                                             int32_t knobPos) {
+	LearnedMIDI& midiInput = midiEngine.midiFollowChannelType[util::to_underlying(feedbackChannelType)];
+
+	int32_t channel = midiInput.channelOrZone;
+	if (midiInput.isForMPEZone()) {
+		channel = midiInput.getMasterChannel();
+	}
+
+	int32_t midiOutputFilter = midiInput.channelOrZone;
+
+	midiEngine.sendCC(this, channel, ccNumber, knobPos + kKnobPosOffset, midiOutputFilter);
+
+	timeLastCCSent[ccNumber] = AudioEngine::audioSampleTimer;
+}
+
+/// called from playback handler
+/// determines whether a pitch bend received is midi follow relevant
+/// and should be routed to the active context or a specific track for further processing
+void MidiFollow::pitchBendReceived(MIDICable& cable, uint8_t channel, uint8_t data1, uint8_t data2, bool* doingMidiThru,
+                                   ModelStack* modelStack) {
+	// first try to process pitch bend received through regular midi follow channels (A/B/C) against the selected /
+	// active clip
+	Output* selected_track =
+	    pitchBendReceivedForSelectedOrActiveClip(cable, channel, data1, data2, doingMidiThru, modelStack);
+
+	// logic for forwarding message to specific track
+	// get number of tracks
+	auto track_count = getTrackCount();
+
+	if (track_count != 0) {
+		// iterate through all the instruments
+		for (int32_t track_index = 0; track_index < track_count; ++track_index) {
+			// ignore track outputs > maximum number of midi follow track channels we have
+			if (track_index >= kNumMIDIFollowChannelTrackTypes) {
+				break;
+			}
+			Output* track = getTrackFromIndex(track_index, track_count);
+			// if track is not null and we did not already send message to this track above
+			if (track != nullptr && track != selected_track) {
+				// next try to process pitch bend received through track midi follow channels (Track1-16)
+				pitchBendReceivedForSpecificTrack(cable, channel, data1, data2, doingMidiThru, modelStack, track,
+				                                  track_index);
+			}
+		}
+	}
+}
+
+/// determines whether a pitch bend received is midi follow relevant
+/// and should be routed to the active context for further processing
+Output* MidiFollow::pitchBendReceivedForSelectedOrActiveClip(MIDICable& cable, uint8_t channel, uint8_t data1,
+                                                             uint8_t data2, bool* doingMidiThru,
+                                                             ModelStack* modelStack) {
+	Output* selected_track = nullptr;
+
+	MIDIMatchType match = checkMidiFollowMatch(cable, channel);
+	if (match != MIDIMatchType::NO_MATCH) {
+		// obtain clip for active context
+		Clip* clip = getActiveClip(modelStack);
+		if (clip) {
+			selected_track = clip->output;
+
+			// ensure output is a kit or melodic instrument
+			if (clip->type != ClipType::INSTRUMENT) {
+				// if it's an audio clip, return the track so it can be skipped by specific track processing
+				return selected_track;
+			}
+
+			ModelStackWithTimelineCounter* modelStackWithTimelineCounter = modelStack->addTimelineCounter(clip);
+
+			if (modelStackWithTimelineCounter) {
+				if (clip->output->type == OutputType::KIT) {
+					Kit* kit = (Kit*)clip->output;
+					kit->receivedPitchBendForKit(modelStackWithTimelineCounter, cable, match, channel, data1, data2,
+					                             doingMidiThru);
+				}
+				else {
+					MelodicInstrument* melodicInstrument = (MelodicInstrument*)clip->output;
+					melodicInstrument->receivedPitchBend(modelStackWithTimelineCounter, cable, match, channel, data1,
+					                                     data2, doingMidiThru);
+				}
+			}
+		}
+	}
+	return selected_track;
+}
+
+/// determines whether a pitch bend received is midi follow relevant
+/// and should be routed to a specific track for further processing
+void MidiFollow::pitchBendReceivedForSpecificTrack(MIDICable& cable, uint8_t channel, uint8_t data1, uint8_t data2,
+                                                   bool* doingMidiThru, ModelStack* modelStack, Output* specific_track,
+                                                   int32_t specific_track_index) {
+	MIDIMatchType match = checkMidiFollowMatchForSpecificTrack(cable, channel, specific_track_index);
+	if (match != MIDIMatchType::NO_MATCH) {
+		// obtain active clip for specific track
+		Clip* clip = specific_track->getActiveClip();
+		if (clip && clip->type == ClipType::INSTRUMENT) {
+			ModelStackWithTimelineCounter* modelStackWithTimelineCounter = modelStack->addTimelineCounter(clip);
+
+			if (modelStackWithTimelineCounter) {
+				if (clip->output->type == OutputType::KIT) {
+					Kit* kit = (Kit*)clip->output;
+					kit->receivedPitchBendForKit(modelStackWithTimelineCounter, cable, match, channel, data1, data2,
+					                             doingMidiThru);
+				}
+				else {
+					MelodicInstrument* melodicInstrument = (MelodicInstrument*)clip->output;
+					melodicInstrument->receivedPitchBend(modelStackWithTimelineCounter, cable, match, channel, data1,
+					                                     data2, doingMidiThru);
+				}
+			}
+		}
+	}
+}
+
+/// called from playback handler
+/// determines whether aftertouch received is midi follow relevant
+/// and should be routed to the active context or a specific track for further processing
+void MidiFollow::aftertouchReceived(MIDICable& cable, int32_t channel, int32_t value, int32_t noteCode,
+                                    bool* doingMidiThru, ModelStack* modelStack) {
+	// first try to process after touch received through regular midi follow channels (A/B/C) against the selected /
+	// active clip
+	Output* selected_track =
+	    aftertouchReceivedForSelectedOrActiveClip(cable, channel, value, noteCode, doingMidiThru, modelStack);
+
+	// logic for forwarding message to specific track
+	// get number of tracks
+	auto track_count = getTrackCount();
+
+	if (track_count != 0) {
+		// iterate through all the instruments
+		for (int32_t track_index = 0; track_index < track_count; ++track_index) {
+			// ignore track outputs > maximum number of midi follow track channels we have
+			if (track_index >= kNumMIDIFollowChannelTrackTypes) {
+				break;
+			}
+			Output* track = getTrackFromIndex(track_index, track_count);
+			// if track is not null and we did not already send message to this track above
+			if (track != nullptr && track != selected_track) {
+				// next try to process after touch received through track midi follow channels (Track1-16)
+				aftertouchReceivedForSpecificTrack(cable, channel, value, noteCode, doingMidiThru, modelStack, track,
+				                                   track_index);
+			}
+		}
+	}
+}
+
+/// determines whether aftertouch received is midi follow relevant
+/// and should be routed to the active context for further processing
+Output* MidiFollow::aftertouchReceivedForSelectedOrActiveClip(MIDICable& cable, int32_t channel, int32_t value,
+                                                              int32_t noteCode, bool* doingMidiThru,
+                                                              ModelStack* modelStack) {
+	Output* selected_track = nullptr;
+
+	MIDIMatchType match = checkMidiFollowMatch(cable, channel);
+	if (match != MIDIMatchType::NO_MATCH) {
+		// obtain clip for active context
+		Clip* clip = getActiveClip(modelStack);
+		if (clip) {
+			selected_track = clip->output;
+
+			// ensure output is a kit or melodic instrument
+			if (clip->type != ClipType::INSTRUMENT) {
+				// if it's an audio clip, return the track so it can be skipped by specific track processing
+				return selected_track;
+			}
+
+			ModelStackWithTimelineCounter* modelStackWithTimelineCounter = modelStack->addTimelineCounter(clip);
+
+			if (modelStackWithTimelineCounter) {
+				if (clip->output->type == OutputType::KIT) {
+					Kit* kit = (Kit*)clip->output;
+					kit->receivedAftertouchForKit(modelStackWithTimelineCounter, cable, match, channel, value, noteCode,
+					                              doingMidiThru);
+				}
+				else {
+					MelodicInstrument* melodicInstrument = (MelodicInstrument*)clip->output;
+					melodicInstrument->receivedAftertouch(modelStackWithTimelineCounter, cable, match, channel, value,
+					                                      noteCode, doingMidiThru);
+				}
+			}
+		}
+	}
+	return selected_track;
+}
+
+/// determines whether aftertouch received is midi follow relevant
+/// and should be routed to a specific track for further processing
+void MidiFollow::aftertouchReceivedForSpecificTrack(MIDICable& cable, int32_t channel, int32_t value, int32_t noteCode,
+                                                    bool* doingMidiThru, ModelStack* modelStack, Output* specific_track,
+                                                    int32_t specific_track_index) {
+	MIDIMatchType match = checkMidiFollowMatchForSpecificTrack(cable, channel, specific_track_index);
+	if (match != MIDIMatchType::NO_MATCH) {
+		// obtain active clip for specific track
+		Clip* clip = specific_track->getActiveClip();
+		if (clip && clip->type == ClipType::INSTRUMENT) {
+			ModelStackWithTimelineCounter* modelStackWithTimelineCounter = modelStack->addTimelineCounter(clip);
+
+			if (modelStackWithTimelineCounter) {
+				if (clip->output->type == OutputType::KIT) {
+					Kit* kit = (Kit*)clip->output;
+					kit->receivedAftertouchForKit(modelStackWithTimelineCounter, cable, match, channel, value, noteCode,
+					                              doingMidiThru);
+				}
+				else {
+					MelodicInstrument* melodicInstrument = (MelodicInstrument*)clip->output;
+					melodicInstrument->receivedAftertouch(modelStackWithTimelineCounter, cable, match, channel, value,
+					                                      noteCode, doingMidiThru);
+				}
+			}
+		}
+	}
+}
+
+/// obtain match to check if device is compatible with the midi follow channel
+/// a valid match is passed through to the instruments for further evaluation
+/// used with regular midi follow channels A/B/C
+MIDIMatchType MidiFollow::checkMidiFollowMatch(MIDICable& cable, uint8_t channel) {
+	MIDIMatchType m = MIDIMatchType::NO_MATCH;
+	for (auto i = 0; i < kNumMIDIFollowChannelTypes; i++) {
+		m = midiEngine.midiFollowChannelType[i].checkMatch(&cable, channel);
+		if (m != MIDIMatchType::NO_MATCH) {
+			return m;
+		}
+	}
+	return m;
+}
+
+/// obtain match to check if device is compatible with the midi follow channel
+/// a valid match is passed through to the instruments for further evaluation
+/// used with midi follow channels for specific tracks 1-16
+MIDIMatchType MidiFollow::checkMidiFollowMatchForSpecificTrack(MIDICable& cable, uint8_t channel,
+                                                               int32_t specific_track_index) {
+	MIDIMatchType m = MIDIMatchType::NO_MATCH;
+	auto i = kNumMIDIFollowChannelTypes + specific_track_index;
+	if (i < kNumMIDIFollowChannelTypesIncludingTracks) {
+		m = midiEngine.midiFollowChannelType[i].checkMatch(&cable, channel);
+		if (m != MIDIMatchType::NO_MATCH) {
+			return m;
+		}
+	}
+	return m;
+}
+
+bool MidiFollow::isFeedbackEnabled() {
+	FeedbackChannelTypes feedbackChannelTypes;
+	return getChannelTypesForFeedback(feedbackChannelTypes) != 0;
+}
+
+/// create default XML file and write defaults
+/// I should check if file exists before creating one
+void MidiFollow::writeDefaultsToFile() {
+	// MidiFollow.xml
+	Error error = StorageManager::createXMLFile(MIDI_FOLLOW_XML, smSerializer, true);
+	if (error != Error::NONE) {
+		return;
+	}
+	Serializer& writer = GetSerializer();
+
+	//<defaults>
+	writer.writeOpeningTagBeginning(MIDI_DEFAULTS_TAG);
+	writer.writeOpeningTagEnd();
+
+	//<cc_mappings>
+	writer.writeOpeningTagBeginning(MIDI_DEFAULTS_CC_TAG);
+	writer.writeOpeningTagEnd();
+	writeDefaultMappingsToFile(writer);
+	writer.writeClosingTag(MIDI_DEFAULTS_CC_TAG);
+
+	//<settings>
+	writer.writeOpeningTagBeginning(MIDI_DEFAULTS_SETTINGS_TAG);
+	writer.writeOpeningTagEnd();
+	writeDefaultSettingsToFile(writer);
+	writer.writeClosingTag(MIDI_DEFAULTS_SETTINGS_TAG);
+
+	writer.writeClosingTag(MIDI_DEFAULTS_TAG);
+
+	writer.closeFileAfterWriting();
+}
+
+/// convert paramID to a paramName to write to XML
+void MidiFollow::writeDefaultMappingsToFile(Serializer& writer) {
+	for (int32_t ccNumber = 0; ccNumber <= kMaxMIDIValue; ccNumber++) {
+		uint8_t soundParamId = ccToSoundParam[ccNumber];
+		uint8_t globalParamId = ccToGlobalParam[ccNumber];
+
+		bool writeTag = false;
+		char const* paramNameSound = nullptr;
+		char const* paramNameGlobal;
+		if (soundParamId != PARAM_ID_NONE && soundParamId < params::UNPATCHED_START) {
+			paramNameSound = params::paramNameForFile(params::Kind::PATCHED, soundParamId, true);
+			writeTag = true;
+		}
+		else if (soundParamId != PARAM_ID_NONE && soundParamId >= params::UNPATCHED_START) {
+			paramNameSound = params::paramNameForFile(params::Kind::UNPATCHED_SOUND, soundParamId, true);
+			writeTag = true;
+		}
+		if (writeTag) {
+			char buffer[10];
+			intToString(ccNumber, buffer);
+			writer.writeTag(paramNameSound, buffer);
+		}
+		else {
+			if (globalParamId != PARAM_ID_NONE) {
+				paramNameGlobal = params::paramNameForFile(params::Kind::UNPATCHED_GLOBAL,
+				                                           params::UNPATCHED_START + globalParamId, true);
+				// Reaching here means no sound param claimed this CC (paramNameSound is still null), so the global
+				// mapping should be written. Only compare names when a sound name actually exists, to avoid passing a
+				// null pointer to strcmp.
+				writeTag = (paramNameSound == nullptr) || strcmp(paramNameGlobal, paramNameSound) != 0;
+			}
+			if (writeTag) {
+				char buffer[10];
+				intToString(ccNumber, buffer);
+				writer.writeTag(paramNameGlobal, buffer);
+			}
+		}
+	}
+}
+
+/// write default settings (channels, kit root note, feedback, display param) to XML
+void MidiFollow::writeDefaultSettingsToFile(Serializer& writer) {
+	//<channels>
+	writer.writeOpeningTagBeginning(MIDI_DEFAULTS_SETTINGS_CHANNELS_TAG);
+	writer.writeOpeningTagEnd();
+
+	writeChannelSettingsToFile(writer);
+
+	writer.writeClosingTag(MIDI_DEFAULTS_SETTINGS_CHANNELS_TAG);
+
+	//<kit_root_note>
+	writer.writeOpeningTagBeginning(MIDI_DEFAULTS_SETTINGS_KITROOTNOTE_TAG);
+	writer.writeOpeningTagEnd();
+
+	writeKitRootNoteSettingToFile(writer);
+
+	writer.writeClosingTag(MIDI_DEFAULTS_SETTINGS_KITROOTNOTE_TAG);
+
+	//<feedback>
+	writer.writeOpeningTagBeginning(MIDI_DEFAULTS_SETTINGS_FEEDBACK_TAG);
+	writer.writeOpeningTagEnd();
+
+	writeFeedbackSettingsToFile(writer);
+
+	writer.writeClosingTag(MIDI_DEFAULTS_SETTINGS_FEEDBACK_TAG);
+
+	//<display_param>
+	writer.writeOpeningTagBeginning(MIDI_DEFAULTS_SETTINGS_DISPLAYPARAM_TAG);
+	writer.writeOpeningTagEnd();
+
+	writeDisplayParamSettingToFile(writer);
+
+	writer.writeClosingTag(MIDI_DEFAULTS_SETTINGS_DISPLAYPARAM_TAG);
+}
+
+/// Write Channel settings to XML
+void MidiFollow::writeChannelSettingsToFile(Serializer& writer) {
+	writeSpecificChannelSettingsToFile(writer, MIDIFollowChannelType::A);
+	writeSpecificChannelSettingsToFile(writer, MIDIFollowChannelType::B);
+	writeSpecificChannelSettingsToFile(writer, MIDIFollowChannelType::C);
+	writeSpecificChannelSettingsToFile(writer, MIDIFollowChannelType::Track1);
+	writeSpecificChannelSettingsToFile(writer, MIDIFollowChannelType::Track2);
+	writeSpecificChannelSettingsToFile(writer, MIDIFollowChannelType::Track3);
+	writeSpecificChannelSettingsToFile(writer, MIDIFollowChannelType::Track4);
+	writeSpecificChannelSettingsToFile(writer, MIDIFollowChannelType::Track5);
+	writeSpecificChannelSettingsToFile(writer, MIDIFollowChannelType::Track6);
+	writeSpecificChannelSettingsToFile(writer, MIDIFollowChannelType::Track7);
+	writeSpecificChannelSettingsToFile(writer, MIDIFollowChannelType::Track8);
+	writeSpecificChannelSettingsToFile(writer, MIDIFollowChannelType::Track9);
+	writeSpecificChannelSettingsToFile(writer, MIDIFollowChannelType::Track10);
+	writeSpecificChannelSettingsToFile(writer, MIDIFollowChannelType::Track11);
+	writeSpecificChannelSettingsToFile(writer, MIDIFollowChannelType::Track12);
+	writeSpecificChannelSettingsToFile(writer, MIDIFollowChannelType::Track13);
+	writeSpecificChannelSettingsToFile(writer, MIDIFollowChannelType::Track14);
+	writeSpecificChannelSettingsToFile(writer, MIDIFollowChannelType::Track15);
+	writeSpecificChannelSettingsToFile(writer, MIDIFollowChannelType::Track16);
+}
+
+/// Write Specific Channel settings to XML
+void MidiFollow::writeSpecificChannelSettingsToFile(Serializer& writer, MIDIFollowChannelType type) {
+	char const* tag_name = getNameFromChannelType(type);
+
+	writer.writeOpeningTagBeginning(tag_name);
+	writer.writeOpeningTagEnd();
+
+	writer.writeTag(MIDI_DEFAULTS_SETTINGS_CHANNEL_TAG,
+	                midiEngine.midiFollowChannelType[util::to_underlying(type)].channelOrZone + 1);
+
+	MIDICable* cable = midiEngine.midiFollowChannelType[util::to_underlying(type)].cable;
+
+	if (cable != nullptr) {
+		// write reference inside <device> tag
+		cable->writeReferenceToFile(writer, MIDI_DEFAULTS_SETTINGS_DEVICE_TAG);
+	}
+
+	writer.writeClosingTag(tag_name);
+}
+
+/// Write Kit Root Note setting to XML
+void MidiFollow::writeKitRootNoteSettingToFile(Serializer& writer) {
+	char note[10];
+	intToString(midiEngine.midiFollowKitRootNote, note);
+	writer.writeTag(MIDI_DEFAULTS_SETTINGS_KITROOTNOTE_NOTE_TAG, note);
+}
+
+/// Write Feedback settings to XML
+void MidiFollow::writeFeedbackSettingsToFile(Serializer& writer) {
+	writer.writeTag(MIDI_DEFAULTS_SETTINGS_CHANNEL_TAG,
+	                getNameFromFeedbackChannelType(midiEngine.midiFollowFeedbackChannelType));
+	writer.writeTag(MIDI_DEFAULTS_SETTINGS_FEEDBACK_AUTOMATION_TAG,
+	                getNameFromFeedbackAutomationMode(midiEngine.midiFollowFeedbackAutomation));
+	writer.writeTag(MIDI_DEFAULTS_SETTINGS_FEEDBACK_FILTER_TAG, getNameFromBool(midiEngine.midiFollowFeedbackFilter));
+}
+
+/// Write Display Param setting to XML
+void MidiFollow::writeDisplayParamSettingToFile(Serializer& writer) {
+	writer.writeTag(MIDI_DEFAULTS_SETTINGS_DISPLAYPARAM_POPUP_TAG, getNameFromBool(midiEngine.midiFollowDisplayParam));
+}
+
+/// read defaults from XML
+void MidiFollow::readDefaultsFromFile() {
+	// no need to keep reading from SD card after first load
+	if (successfullyReadDefaultsFromFile) {
+		return;
+	}
+
+	init();
+
+	FilePointer fp;
+	// MIDIFollow.XML
+	bool success = StorageManager::fileExists(MIDI_FOLLOW_XML, &fp);
+	if (!success) {
+		// if file doesn't exist, lets make SETTINGS folder if it doesn't already exist
+		FRESULT result = f_mkdir(SETTINGS_FOLDER);
+		if (result == FR_OK || result == FR_EXIST) {
+			// folder eixsts now, write defaults
+			writeDefaultsToFile();
+			successfullyReadDefaultsFromFile = true;
+			return;
+		}
+	}
+
+	//<defaults>
+	Error error = StorageManager::openXMLFile(&fp, smDeserializer, MIDI_DEFAULTS_TAG);
+	if (error != Error::NONE) {
+		writeDefaultsToFile();
+		successfullyReadDefaultsFromFile = true;
+		return;
+	}
+
+	// Clear mappings before reading the settings from the file
+	clearMappings();
+
+	Deserializer& reader = *activeDeserializer;
+	char const* tag_name;
+	while (*(tag_name = reader.readNextTagOrAttributeName())) {
+		// step into the <cc_mappings> tag
+		if (!strcmp(tag_name, MIDI_DEFAULTS_CC_TAG)) {
+			readDefaultMappingsFromFile(reader);
+		}
+		// step into the <settings> tag
+		else if (!strcmp(tag_name, MIDI_DEFAULTS_SETTINGS_TAG)) {
+			readDefaultSettingsFromFile(reader);
+		}
+		reader.exitTag();
+	}
+	activeDeserializer->closeWriter();
+	successfullyReadDefaultsFromFile = true;
+}
+
+/// compares param name tag to the list of params available are midi controllable
+/// if param is found, it loads the CC mapping info for that param into the view
+void MidiFollow::readDefaultMappingsFromFile(Deserializer& reader) {
+	char const* tag_name;
+	bool foundParam;
+	while (*(tag_name = reader.readNextTagOrAttributeName())) {
+		foundParam = false;
+		int32_t value = reader.readTagOrAttributeValueInt();
+		// Loop through patched sound params
+		for (uint8_t paramId = 0; paramId < params::GLOBAL_NONE; paramId++) {
+			if (!strcmp(tag_name, params::paramNameForFile(params::Kind::PATCHED, paramId, true))) {
+				soundParamToCC[paramId] = value;
+				ccToSoundParam[value] = paramId;
+				foundParam = true;
+				break;
+			}
+		}
+		if (!foundParam) {
+			// Loop through unpatched sound params (if not found before)
+			for (uint8_t paramId = 0; paramId < params::UNPATCHED_SOUND_MAX_NUM; paramId++) {
+				if (!strcmp(tag_name, params::paramNameForFile(params::Kind::UNPATCHED_SOUND,
+				                                               params::UNPATCHED_START + paramId, true))) {
+					soundParamToCC[params::UNPATCHED_START + paramId] = value;
+					ccToSoundParam[value] = params::UNPATCHED_START + paramId;
+					foundParam = true;
+					break;
+				}
+			}
+		}
+		// Loop through global params
+		for (uint8_t paramId = 0; paramId < params::UNPATCHED_GLOBAL_MAX_NUM; paramId++) {
+			if (!strcmp(tag_name, params::paramNameForFile(params::Kind::UNPATCHED_GLOBAL,
+			                                               params::UNPATCHED_START + paramId, true))) {
+				globalParamToCC[paramId] = value;
+				ccToGlobalParam[value] = paramId;
+				break;
+			}
+		}
+		// exit out of this tag so you can check the next tag
+		reader.exitTag();
+	}
+}
+
+/// read default settings (channels, kit root note, feedback, display param) from XML
+void MidiFollow::readDefaultSettingsFromFile(Deserializer& reader) {
+	char const* tag_name;
+	while (*(tag_name = reader.readNextTagOrAttributeName())) {
+		// step into <channels> tag
+		if (!strcmp(tag_name, MIDI_DEFAULTS_SETTINGS_CHANNELS_TAG)) {
+			readChannelSettingsFromFile(reader);
+		}
+		// step into <kit_root_note> tag
+		else if (!strcmp(tag_name, MIDI_DEFAULTS_SETTINGS_KITROOTNOTE_TAG)) {
+			readKitRootNoteSettingFromFile(reader);
+		}
+		// step into <feedback> tag
+		else if (!strcmp(tag_name, MIDI_DEFAULTS_SETTINGS_FEEDBACK_TAG)) {
+			readFeedbackSettingsFromFile(reader);
+		}
+		// step into <display_param> tag
+		else if (!strcmp(tag_name, MIDI_DEFAULTS_SETTINGS_DISPLAYPARAM_TAG)) {
+			readDisplayParamSettingFromFile(reader);
+		}
+		reader.exitTag();
+	}
+}
+
+/// Read Channel settings from XML
+void MidiFollow::readChannelSettingsFromFile(Deserializer& reader) {
+	char const* tag_name;
+	while (*(tag_name = reader.readNextTagOrAttributeName())) {
+		// step into first channel type tag
+		MIDIFollowChannelType type = getChannelTypeFromName(tag_name);
+		if (type != MIDIFollowChannelType::INVALID) {
+			readSpecificChannelSettingsFromFile(reader, type);
+		}
+		// exit so we can step into next tag
+		reader.exitTag();
+	}
+}
+
+/// Read Specific Channel settings from XML
+void MidiFollow::readSpecificChannelSettingsFromFile(Deserializer& reader, MIDIFollowChannelType type) {
+	char const* tag_name;
+	while (*(tag_name = reader.readNextTagOrAttributeName())) {
+		// step into <channel> tag
+		if (!strcmp(tag_name, MIDI_DEFAULTS_SETTINGS_CHANNEL_TAG)) {
+			int32_t value = reader.readTagOrAttributeValueInt();
+			if (value >= 0 && value < NUM_CHANNELS) {
+				midiEngine.midiFollowChannelType[util::to_underlying(type)].channelOrZone = value - 1;
+			}
+		}
+		// step into <device> tag
+		else if (!strcmp(tag_name, MIDI_DEFAULTS_SETTINGS_DEVICE_TAG)) {
+			midiEngine.midiFollowChannelType[util::to_underlying(type)].cable =
+			    MIDIDeviceManager::readDeviceReferenceFromFile(reader);
+		}
+		// exit so we can step into next tag
+		reader.exitTag();
+	}
+}
+
+/// Read Kit Root Note setting from XML
+void MidiFollow::readKitRootNoteSettingFromFile(Deserializer& reader) {
+	char const* tag_name;
+	while (*(tag_name = reader.readNextTagOrAttributeName())) {
+		// step into <note> tag
+		if (!strcmp(tag_name, MIDI_DEFAULTS_SETTINGS_KITROOTNOTE_NOTE_TAG)) {
+			int32_t value = reader.readTagOrAttributeValueInt();
+			if (value >= 0 && value <= kMaxMIDIValue) {
+				midiEngine.midiFollowKitRootNote = value;
+			}
+		}
+		// exit so we can step into next tag
+		reader.exitTag();
+	}
+}
+
+/// Read Feedback settings from XML
+void MidiFollow::readFeedbackSettingsFromFile(Deserializer& reader) {
+	char const* tag_name;
+	while (*(tag_name = reader.readNextTagOrAttributeName())) {
+		// step into <channel> tag
+		if (!strcmp(tag_name, MIDI_DEFAULTS_SETTINGS_CHANNEL_TAG)) {
+			char const* value = reader.readTagOrAttributeValue();
+			MIDIFollowFeedbackChannelType type = getFeedbackChannelTypeFromName(value);
+			if (type != MIDIFollowFeedbackChannelType::INVALID) {
+				midiEngine.midiFollowFeedbackChannelType = type;
+			}
+		}
+		// step into <automation> tag
+		else if (!strcmp(tag_name, MIDI_DEFAULTS_SETTINGS_FEEDBACK_AUTOMATION_TAG)) {
+			char const* value = reader.readTagOrAttributeValue();
+			MIDIFollowFeedbackAutomationMode mode = getFeedbackAutomationModeFromName(value);
+			if (mode != MIDIFollowFeedbackAutomationMode::INVALID) {
+				midiEngine.midiFollowFeedbackAutomation = mode;
+			}
+		}
+		// step into <filter> tag
+		else if (!strcmp(tag_name, MIDI_DEFAULTS_SETTINGS_FEEDBACK_FILTER_TAG)) {
+			char const* value = reader.readTagOrAttributeValue();
+			midiEngine.midiFollowFeedbackFilter = getBoolFromName(value);
+		}
+		// exit so we can step into next tag
+		reader.exitTag();
+	}
+}
+
+/// Read Display Param setting from XML
+void MidiFollow::readDisplayParamSettingFromFile(Deserializer& reader) {
+	char const* tag_name;
+	while (*(tag_name = reader.readNextTagOrAttributeName())) {
+		// step into <popup> tag
+		if (!strcmp(tag_name, MIDI_DEFAULTS_SETTINGS_DISPLAYPARAM_POPUP_TAG)) {
+			char const* value = reader.readTagOrAttributeValue();
+			midiEngine.midiFollowDisplayParam = getBoolFromName(value);
+		}
+		// exit so we can step into next tag
+		reader.exitTag();
+	}
+}
+
+/// enum / string lookup functions
+
+char const* MidiFollow::getNameFromChannelType(MIDIFollowChannelType type) {
+	return channelTypeMap(type);
+}
+
+MIDIFollowChannelType MidiFollow::getChannelTypeFromName(char const* name) {
+	return channelTypeMap(name, MIDIFollowChannelType::INVALID);
+}
+
+char const* MidiFollow::getNameFromFeedbackChannelType(MIDIFollowFeedbackChannelType type) {
+	return feedbackChannelTypeMap(type);
+}
+
+MIDIFollowFeedbackChannelType MidiFollow::getFeedbackChannelTypeFromName(char const* name) {
+	return feedbackChannelTypeMap(name, MIDIFollowFeedbackChannelType::INVALID);
+}
+
+char const* MidiFollow::getNameFromFeedbackAutomationMode(MIDIFollowFeedbackAutomationMode mode) {
+	return feedbackAutomationModeMap(mode);
+}
+
+MIDIFollowFeedbackAutomationMode MidiFollow::getFeedbackAutomationModeFromName(char const* name) {
+	return feedbackAutomationModeMap(name);
+}
+
+char const* MidiFollow::getNameFromBool(bool value) {
+	return value == true ? "enabled" : "disabled";
+}
+
+bool MidiFollow::getBoolFromName(char const* name) {
+	return !strcmp(name, "enabled");
+}

@@ -1,0 +1,58 @@
+{
+    "files.eol": "\n",
+    "files.insertFinalNewline": true,
+    "files.encoding": "utf8",
+    "files.trimTrailingWhitespace": true,
+    "cmake.generator": "Ninja Multi-Config",
+    "[python]": {
+        "editor.defaultFormatter": "charliermarsh.ruff",
+        "editor.formatOnSave": true
+    },
+    "files.associations": {
+        "*.scons": "python",
+        "compare": "cpp",
+        "ranges": "cpp",
+        "cmath": "cpp",
+        "filesystem": "cpp",
+        "memory_resource": "cpp",
+        "array": "cpp",
+        "span": "cpp",
+        "vector": "cpp",
+        "xstring": "cpp",
+        "xutility": "cpp",
+        "string": "cpp",
+        "string_view": "cpp",
+        "cwchar": "cpp",
+        "initializer_list": "cpp",
+        "utility": "cpp"
+    },
+    "cSpell.words": [
+        "SDRAM",
+        "Synthstrom"
+    ],
+    "cmake.configureEnvironment": {
+        "DELUGE_FW_ROOT": "${workspaceRoot}"
+    },
+    "cortex-debug.armToolchainPath": "${workspaceRoot}/toolchain/current/arm-none-eabi-gcc/bin",
+    "advancedLocalFormatters.formatters": [
+        {
+            "command": {
+                "win32": [
+                    "dbt.cmd",
+                    "format",
+                    "--stdio",
+                    "$absoluteFilePath"
+                ],
+                "*": [
+                    "./dbt",
+                    "format",
+                    "--stdio",
+                    "$absoluteFilePath"
+                ]
+            },
+            "languages": [
+                "cpp"
+            ]
+        }
+    ]
+}

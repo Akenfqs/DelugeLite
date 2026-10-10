@@ -1,0 +1,41 @@
+/*
+ * Copyright © 2022-2023 Synthstrom Audible Limited
+ *
+ * This file is part of The Synthstrom Audible Deluge Firmware.
+ *
+ * The Synthstrom Audible Deluge Firmware is free software: you can redistribute it and/or modify it under the
+ * terms of the GNU General Public License as published by the Free Software Foundation,
+ * either version 3 of the License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+ * without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along with this program.
+ * If not, see <https://www.gnu.org/licenses/>.
+ */
+
+#pragma once
+
+#include "gui/ui/qwerty_ui.h"
+
+class RenameUI : public QwertyUI {
+public:
+	RenameUI(const char* title_);
+	bool opened();
+	void displayText(bool blinkImmediately = false) override;
+	void renderOLED(deluge::hid::display::oled_canvas::Canvas& canvas) override;
+	bool getGreyoutColsAndRows(uint32_t* cols, uint32_t* rows) override;
+	ActionResult exitUI() override;
+	ActionResult buttonAction(deluge::hid::Button b, bool on, bool inCardRoutine) override;
+	ActionResult padAction(int32_t x, int32_t y, int32_t velocity) override;
+	ActionResult verticalEncoderAction(int32_t offset, bool inCardRoutine) override;
+	UIType getUIType() override { return UIType::RENAME; }
+
+protected:
+	void enterKeyPress() override;
+	virtual bool trySetName(std::string_view) = 0;
+	virtual std::string_view getCurrentName() const = 0;
+	virtual bool canRename() const { return true; }
+	virtual bool allowEmpty() const { return true; }
+};

@@ -1,0 +1,1939 @@
+/*
+ * Copyright © 2019-2023 Synthstrom Audible Limited
+ *
+ * This file is part of The Synthstrom Audible Deluge Firmware.
+ *
+ * The Synthstrom Audible Deluge Firmware is free software: you can redistribute it and/or modify it under the
+ * terms of the GNU General Public License as published by the Free Software Foundation,
+ * either version 3 of the License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+ * without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along with this program.
+ * If not, see <https://www.gnu.org/licenses/>.
+ */
+
+#include "gui/ui/browser/browser.h"
+#include "definitions_cxx.hpp"
+#include "extern.h"
+#include "fatfs.hpp"
+#include "gui/context_menu/delete_file.h"
+#include "gui/l10n/l10n.h"
+#include "gui/ui/browser/default_name.h"
+#include "gui/ui_timer_manager.h"
+#include "gui/views/view.h"
+#include "hid/buttons.h"
+#include "hid/display/display.h"
+#include "hid/display/oled.h"
+#include "hid/encoders.h"
+#include "hid/matrix/matrix_driver.h"
+#include "io/debug/log.h"
+#include "model/instrument/instrument.h"
+#include "model/song/song.h"
+#include "processing/engines/audio_engine.h"
+#include "storage/audio/audio_file_manager.h"
+#include "storage/file_item.h"
+#include "storage/storage_manager.h"
+#include "util/functions.h"
+#include "util/try.h"
+#include <cstring>
+#include <new>
+
+using namespace deluge;
+
+String Browser::currentDir{};
+bool Browser::qwertyVisible;
+
+CStringArray Browser::fileItems{sizeof(FileItem)};
+int32_t Browser::scrollPosVertical;
+int32_t Browser::fileIndexSelected;
+int32_t Browser::numCharsInPrefix;
+bool Browser::arrivedAtFileByTyping;
+int32_t Browser::numFileItemsDeletedAtStart;
+int32_t Browser::numFileItemsDeletedAtEnd;
+String Browser::firstFileItemRemaining{};
+String Browser::lastFileItemRemaining{};
+OutputType Browser::outputTypeToLoad;
+char const** Browser::allowedFileExtensions;
+bool Browser::allowFoldersSharingNameWithFile;
+char const* Browser::filenameToStartSearchAt;
+
+// 7SEG ONLY
+int8_t Browser::numberEditPos;
+NumericLayerScrollingText* Browser::scrollingText;
+
+char const* allowedFileExtensionsXML[] = {"XML", "Json", NULL};
+
+Browser::Browser() {
+	fileIcon = deluge::hid::display::OLED::songIcon;
+	fileIconPt2 = nullptr;
+	fileIconPt2Width = 0;
+	scrollingText = NULL;
+	shouldWrapFolderContents = true;
+
+	mayDefaultToBrandNewNameOnEntry = false;
+	qwertyAlwaysVisible = true;
+	qwertyVisible = true; // Because for most Browsers, it'll just always be true.
+	filePrefix = NULL;
+	shouldInterpretNoteNamesForThisBrowser = false;
+}
+
+bool Browser::opened() {
+	numCharsInPrefix = 0; // For most browsers, this just stays at 0.
+	arrivedAtFileByTyping = false;
+	allowedFileExtensions = allowedFileExtensionsXML;
+	allowFoldersSharingNameWithFile = false;
+
+	numberEditPos = -1;
+
+	return QwertyUI::opened();
+}
+
+// returns true if the FP for the filepath is correct
+bool Browser::checkFP() {
+	FileItem* currentFileItem = getCurrentFileItem();
+	String filePath;
+	Error error = getCurrentFilePath(&filePath);
+	if (error != Error::NONE) {
+		D_PRINTLN("couldn't get filepath");
+		return false;
+	}
+
+	FilePointer tempfp;
+	bool fileExists = StorageManager::fileExists(filePath.get(), &tempfp);
+	if (!fileExists) {
+		D_PRINTLN("couldn't get filepath");
+		return false;
+	}
+	else if (tempfp.sclust != currentFileItem->filePointer.sclust) {
+		D_PRINTLN("FPs don't match: correct is %lu but the browser has %lu", tempfp.sclust,
+		          currentFileItem->filePointer.sclust);
+#if ALPHA_OR_BETA_VERSION
+		display->freezeWithError("B001");
+#endif
+		return false;
+	}
+	return true;
+}
+
+void Browser::close() {
+	emptyFileItems();
+	favouritesManager.close();
+	QwertyUI::close();
+}
+
+void Browser::emptyFileItems() {
+
+	AudioEngine::logAction("emptyFileItems");
+
+	for (int32_t i = 0; i < fileItems.getNumElements();) {
+		FileItem* item = (FileItem*)fileItems.getElementAddress(i);
+		item->~FileItem();
+
+		i++;
+		if (!(i & 63)) { //  &127 was even fine, even with only -Og compiler optimization.
+			AudioEngine::logAction("emptyFileItems in loop");
+			AudioEngine::routineWithClusterLoading();
+		}
+	}
+
+	AudioEngine::logAction("emptyFileItems 2");
+
+	fileItems.empty();
+
+	AudioEngine::logAction("emptyFileItems 3");
+}
+
+void Browser::deleteSomeFileItems(int32_t startAt, int32_t stopAt) {
+
+	// Call destructors.
+	for (int32_t i = startAt; i < stopAt;) {
+		FileItem* item = (FileItem*)fileItems.getElementAddress(i);
+		item->~FileItem();
+
+		i++;
+		if (!(i & 63)) { //  &127 was even fine, even with only -Og compiler optimization.
+			AudioEngine::routineWithClusterLoading();
+		}
+	}
+
+	fileItems.deleteAtIndex(startAt, stopAt - startAt);
+}
+
+int32_t maxNumFileItemsNow;
+
+int32_t catalogSearchDirection;
+
+FileItem* Browser::getNewFileItem() {
+	bool alreadyCulled = false;
+
+	if (fileItems.getNumElements() >= maxNumFileItemsNow) {
+doCull:
+		cullSomeFileItems();
+		alreadyCulled = true;
+	}
+
+	int32_t newIndex = fileItems.getNumElements();
+	Error error = fileItems.insertAtIndex(newIndex);
+	if (error != Error::NONE) {
+		if (alreadyCulled) {
+			return nullptr;
+		}
+		else {
+			goto doCull;
+		}
+	}
+
+	void* newMemory = fileItems.getElementAddress(newIndex);
+
+	FileItem* thisItem = new (newMemory) FileItem();
+	return thisItem;
+}
+
+void Browser::cullSomeFileItems() {
+	sortFileItems();
+
+	int32_t startAt, stopAt;
+
+	int32_t numFileItemsDeletingNow = fileItems.getNumElements() - (maxNumFileItemsNow >> 1); // May get modified below.
+	if (numFileItemsDeletingNow <= 0) {
+		return;
+	}
+
+	// If we already know what side we want to be deleting on...
+	if (catalogSearchDirection == CATALOG_SEARCH_LEFT) {
+deleteFromLeftSide:
+		numFileItemsDeletedAtStart += numFileItemsDeletingNow;
+		startAt = 0;
+		stopAt = numFileItemsDeletingNow;
+		firstFileItemRemaining.set(((FileItem*)fileItems.getElementAddress(numFileItemsDeletingNow))->displayName);
+	}
+	else if (catalogSearchDirection == CATALOG_SEARCH_RIGHT) {
+deleteFromRightSide:
+		numFileItemsDeletedAtEnd += numFileItemsDeletingNow;
+		stopAt = fileItems.getNumElements();
+		startAt = stopAt - numFileItemsDeletingNow;
+		lastFileItemRemaining.set(((FileItem*)fileItems.getElementAddress(startAt - 1))->displayName);
+	}
+
+	// Or if we've been using a search term *and* searching both directions, try to tend towards keeping equal amounts
+	// of FileIems either side.
+	else {
+
+		shouldInterpretNoteNames = shouldInterpretNoteNamesForThisBrowser;
+		octaveStartsFromA = false;
+		int32_t foundIndex = fileItems.search(filenameToStartSearchAt);
+
+		// If search-item is in second half, delete from start.
+		if ((foundIndex << 1) >= fileItems.getNumElements()) {
+			int32_t newNumFilesDeleting =
+			    foundIndex >> 1; // Delete half the existing items to the left of the search-item.
+			if (newNumFilesDeleting <= 0) {
+				return;
+			}
+			if (numFileItemsDeletingNow > newNumFilesDeleting) {
+				numFileItemsDeletingNow = newNumFilesDeleting;
+			}
+			goto deleteFromLeftSide;
+		}
+
+		// Or, vice versa.
+		else {
+			int32_t newNumFilesDeleting = (fileItems.getNumElements() - foundIndex)
+			                              >> 1; // Delete half the existing items to the right of the search-item.
+			if (newNumFilesDeleting <= 0) {
+				return;
+			}
+			if (numFileItemsDeletingNow > newNumFilesDeleting) {
+				numFileItemsDeletingNow = newNumFilesDeleting;
+			}
+			goto deleteFromRightSide;
+		}
+	}
+
+	if (startAt != stopAt) {
+		deleteSomeFileItems(startAt, stopAt); // Check might not be necessary?
+	}
+}
+
+Error Browser::readFileItemsForFolder(char const* filePrefixHere, bool allowFolders,
+                                      char const** allowedFileExtensionsHere, char const* filenameToStartAt,
+                                      int32_t newMaxNumFileItems, int32_t newCatalogSearchDirection) {
+
+	AudioEngine::logAction("readFileItemsForFolder");
+
+	emptyFileItems();
+
+	Error error = StorageManager::initSD();
+	if (error != Error::NONE) {
+		return error;
+	}
+
+	staticDIR =
+	    D_TRY_CATCH(FatFS::Directory::open(currentDir.get()), error, { return fatfsErrorToDelugeError(error); });
+
+	numFileItemsDeletedAtStart = 0;
+	numFileItemsDeletedAtEnd = 0;
+	firstFileItemRemaining.clear();
+	lastFileItemRemaining.clear();
+	catalogSearchDirection = newCatalogSearchDirection;
+	maxNumFileItemsNow = newMaxNumFileItems;
+	filenameToStartSearchAt = filenameToStartAt;
+
+	while (true) {
+		AudioEngine::logAction("while loop");
+
+		audioFileManager.loadAnyEnqueuedClusters();
+		FilePointer thisFilePointer;
+
+		std::tie(staticFNO, thisFilePointer) = D_TRY_CATCH(staticDIR.read_and_get_filepointer(), error, {
+			break; // Break on error
+		});
+
+		if (staticFNO.fname[0] == 0) {
+			break; /* Break on end of dir */
+		}
+		if (staticFNO.fname[0] == '.') {
+			continue; /* Ignore dot entry */
+		}
+		bool isFolder = staticFNO.fattrib & AM_DIR;
+		if (isFolder) {
+			if (!allowFolders) {
+				continue;
+			}
+		}
+		else {
+			char const* dotPos = strrchr(staticFNO.fname, '.');
+			if (!dotPos) {
+extensionNotSupported:
+				continue;
+			}
+			char const* fileExtension = dotPos + 1;
+			char const** thisExtension = allowedFileExtensionsHere;
+			while (strcasecmp(fileExtension, *thisExtension)) {
+				thisExtension++;
+				if (!*thisExtension) {
+					goto extensionNotSupported; // If reached end of list
+				}
+			}
+		}
+
+		FileItem* thisItem = getNewFileItem();
+		if (!thisItem) {
+			error = Error::INSUFFICIENT_RAM;
+			break;
+		}
+		error = thisItem->filename.set(staticFNO.fname);
+		if (error != Error::NONE) {
+			break;
+		}
+		thisItem->isFolder = isFolder;
+		thisItem->filePointer = thisFilePointer;
+
+		// displayName is the CStringArray sort key, and must equal the real on-card name. The 7SEG short form ("185")
+		// is produced at render time, not stored here - storing it made enteredText display-dependent, which is what
+		// broke default naming on 7SEG (#1069).
+		thisItem->displayName = thisItem->filename.get();
+	}
+	staticDIR.close();
+
+	if (error != Error::NONE) {
+		emptyFileItems();
+	}
+
+	return error;
+}
+
+void Browser::deleteFolderAndDuplicateItems(Availability instrumentAvailabilityRequirement) {
+	int32_t writeI = 0;
+	FileItem* nextItem = (FileItem*)fileItems.getElementAddress(0);
+
+	for (int32_t readI = 0; readI < fileItems.getNumElements(); readI++) {
+		FileItem* readItem = nextItem;
+
+		// If there's a next item after "this" item, to compare it to...
+		if (readI < fileItems.getNumElements() - 1) {
+			nextItem = (FileItem*)fileItems.getElementAddress(readI + 1);
+
+			// If we're a folder, and the next item is a file of the same name, delete this item.
+			if (readItem->isFolder) {
+				if (!nextItem->isFolder) {
+					int32_t nameLength = readItem->filename.getLength();
+					char const* nextItemFilename = nextItem->filename.get();
+					if (!memcasecmp(readItem->filename.get(), nextItemFilename, nameLength)) {
+						if (nextItemFilename[nameLength] == '.' && !strchr(&nextItemFilename[nameLength + 1], '.')) {
+							goto deleteThisItem;
+						}
+					}
+				}
+			}
+
+			// Or if we have an Instrument, and the next item is a file of the same name, delete the next item.
+			else if (readItem->instrument) {
+				if (!nextItem->instrument && !nextItem->isFolder) {
+					if (!strcasecmp(readItem->displayName, nextItem->displayName)) {
+						// if (readItem->filename.equalsCaseIrrespective(&nextItem->filename)) {
+						if (readItem->maybeExistsOnCard && readItem->filePointer.sclust == 0) {
+							readItem->filePointer = nextItem->filePointer;
+						}
+						nextItem->~FileItem();
+						readI++;
+						nextItem = (FileItem*)fileItems.getElementAddress(readI + 1);
+						// That may set it to an invalid address, but in that case, it won't get read.
+					}
+				}
+
+checkAvailabilityRequirement:
+				// Check Instrument's availabilityRequirement
+				if (readItem->instrumentAlreadyInSong) {
+					if (instrumentAvailabilityRequirement == Availability::INSTRUMENT_UNUSED) {
+deleteThisItem:
+						readItem->~FileItem();
+						continue;
+					}
+					else if (instrumentAvailabilityRequirement == Availability::INSTRUMENT_AVAILABLE_IN_SESSION) {
+						if (currentSong->doesOutputHaveActiveClipInSession(readItem->instrument)) {
+							goto deleteThisItem;
+						}
+					}
+				}
+			}
+
+			// Or if next item has an Instrument, and we're just a file...
+			else if (nextItem->instrument) {
+				if (!strcasecmp(readItem->displayName, nextItem->displayName)) { // And if same name...
+					if (nextItem->maybeExistsOnCard && nextItem->filePointer.sclust == 0) {
+						nextItem->filePointer = readItem->filePointer;
+					}
+					goto deleteThisItem;
+				}
+			}
+		}
+		else {
+			if (readItem->instrument) {
+				goto checkAvailabilityRequirement;
+			}
+		}
+
+		void* writeAddress = fileItems.getElementAddress(writeI);
+		if (writeAddress != readItem) {
+			memcpy(writeAddress, readItem, sizeof(FileItem));
+		}
+		writeI++;
+	}
+
+	int32_t numToDelete = fileItems.getNumElements() - writeI;
+	if (numToDelete > 0) {
+		fileItems.deleteAtIndex(writeI, numToDelete);
+	}
+
+	// Our system of keeping FileItems from getting too full by deleting elements from its ends as we go could have
+	// caused bad results at the edges of the above, so delete a further one element at each end as needed.
+	if (!firstFileItemRemaining.isEmpty()) {
+		fileItems.deleteAtIndex(0);
+	}
+	if (!lastFileItemRemaining.isEmpty()) {
+		fileItems.deleteAtIndex(fileItems.getNumElements() - 1);
+	}
+}
+
+Error Browser::setFileByFullPath(OutputType outputType, char const* fullPath) {
+	arrivedAtFileByTyping = true;
+	FilePointer tempfp;
+	bool fileExists = StorageManager::fileExists(fullPath, &tempfp);
+	if (!fileExists) {
+		return Error::FILE_NOT_FOUND;
+	}
+
+	const char* fileName = getFileNameFromEndOfPath(fullPath);
+	// Copy the directory portion (everything before the final '/') straight into currentDir. String::set copies, so we
+	// bound it by length rather than building a temporary - the old getPathFromFullPath() returned a pointer into a
+	// std::string temporary that was already destroyed by the time we read it.
+	char const* slashPos = strrchr(fullPath, '/');
+	if (slashPos) {
+		currentDir.set(fullPath, (int32_t)(slashPos - fullPath));
+	}
+	else {
+		currentDir.clear();
+	}
+
+	// Change to the File Folder
+	Error error = arrivedInNewFolder(0, fileName);
+	if (error != Error::NONE) {
+		return error;
+	}
+
+	//  Get the File Index
+	fileIndexSelected = fileItems.search(fileName);
+	if (fileIndexSelected > fileItems.getNumElements()) {
+		return Error::FILE_NOT_FOUND;
+	}
+
+	// Update the Display
+	scrollPosVertical = fileIndexSelected;
+	setEnteredTextFromCurrentFilename();
+	renderUIsForOled();
+
+	// Inform the Load UI that the File has changed
+	currentFileChanged(1);
+	return Error::NONE;
+}
+
+// song may be supplied as NULL, in which case it won't be searched for Instruments; sometimes this will get called when
+// the currentSong is not set up.
+Error Browser::readFileItemsFromFolderAndMemory(Song* song, OutputType outputType, char const* filePrefixHere,
+                                                char const* filenameToStartAt, char const* defaultDirToAlsoTry,
+                                                bool allowFolders, Availability availabilityRequirement,
+                                                int32_t newCatalogSearchDirection) {
+	// filenameToStartAt should have .XML at the end of it.
+	bool triedCreatingFolder = false;
+
+tryReadingItems:
+	Error error = readFileItemsForFolder(filePrefixHere, allowFolders, allowedFileExtensions, filenameToStartAt,
+	                                     FILE_ITEMS_MAX_NUM_ELEMENTS, newCatalogSearchDirection);
+	if (error != Error::NONE) {
+
+		// If folder didn't exist, try our alternative one if there is one.
+		if (error == Error::FOLDER_DOESNT_EXIST) {
+			if (defaultDirToAlsoTry) {
+				// ... only if we haven't already tried the alternative folder.
+				if (!currentDir.equalsCaseIrrespective(defaultDirToAlsoTry)) {
+					filenameToStartAt = NULL;
+					Error error = currentDir.set(defaultDirToAlsoTry);
+					if (error != Error::NONE) {
+						return error;
+					}
+					goto tryReadingItems;
+				}
+
+				// Or if we have already tried it and it didn't exist, try creating it...
+				else {
+					// But not if we already tried.
+					if (triedCreatingFolder) {
+						return error;
+					}
+					FRESULT result = f_mkdir(defaultDirToAlsoTry);
+					if (result == FR_OK) {
+						triedCreatingFolder = true;
+						goto tryReadingItems;
+					}
+					else {
+						return fresultToDelugeErrorCode(result);
+					}
+				}
+			}
+		}
+
+		return error;
+	}
+
+	if (song && outputType != OutputType::NONE) {
+		error = song->addInstrumentsToFileItems(outputType);
+		if (error != Error::NONE) {
+			return error;
+		}
+	}
+
+	if (fileItems.getNumElements()) {
+		sortFileItems();
+
+		if (fileItems.getNumElements()) {
+			// Delete folders sharing name of file.
+			// And, files sharing name of in-memory Instrument.
+			if (!allowFoldersSharingNameWithFile) {
+				deleteFolderAndDuplicateItems(
+				    Availability::ANY); // I think this is right - was Availability::INSTRUMENT_UNUSED until 2023-01
+			}
+		}
+	}
+
+	return Error::NONE;
+}
+
+namespace {
+/// Whether `fileName` belongs to the "<prefix><digits>" family. The digits must run all the way to the extension:
+/// without that, a neighbour like "JAM 2024-01-05.XML" joins the "JAM " family, reads as number 2024, and sends the
+/// next save to "JAM 2025". Date-suffixed names are common on real cards.
+bool isNumberedFamilyMember(char const* fileName, char const* prefix, int32_t prefixLength) {
+	if (memcasecmp(fileName, prefix, prefixLength)) {
+		return false;
+	}
+	char const* pos = &fileName[prefixLength];
+	if (*pos < '0' || *pos > '9') {
+		return false;
+	}
+	while (*pos >= '0' && *pos <= '9') {
+		pos++;
+	}
+	return *pos == '.' || *pos == 0;
+}
+
+/// If `fileName` is "<stem><letter>" plus an extension, returns 0-25 for that letter; -1 otherwise. Case does not
+/// matter, so "SONG185a.XML" and "SONG185A.Json" are the same variation.
+int32_t letterVariationOf(char const* fileName, char const* stem, int32_t stemLength) {
+	if (memcasecmp(fileName, stem, stemLength)) {
+		return -1;
+	}
+	char letter = fileName[stemLength];
+	if (letter >= 'a' && letter <= 'z') {
+		letter -= 32;
+	}
+	if (letter < 'A' || letter > 'Z') {
+		return -1;
+	}
+	char after = fileName[stemLength + 1];
+	return (after == '.' || after == 0) ? letter - 'A' : -1;
+}
+
+/// Whether `fileName` carries one of the extensions the browser lists, and so names a file a save could collide with.
+bool isAllowedFileExtension(char const* fileName, char const** allowedExtensions) {
+	char const* dotPos = strrchr(fileName, '.');
+	if (!dotPos) {
+		return false;
+	}
+	for (char const** thisExtension = allowedExtensions; *thisExtension; thisExtension++) {
+		if (!strcasecmp(dotPos + 1, *thisExtension)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/// Adapts the browser to the FileListView seam used by nextDefaultName().
+///
+/// Each query combines two sources. The card is surveyed directly, because fileItems may be a window; and fileItems
+/// is then folded in, because it carries Instruments held in memory that are not on the card yet (see
+/// Song::addInstrumentsToFileItems - "in case the next one in line isn't saved"), whose names are equally taken.
+/// Folding in a window is safe here: it can only ever add variations, never hide one.
+class BrowserFileListView final : public deluge::gui::browser::FileListView {
+public:
+	std::string highestNumberedName(char const* prefix) const override {
+		String highest;
+		surveyCard(prefix, &highest, nullptr);
+
+		int32_t prefixLength = strlen(prefix);
+		forEachFileItem([&](char const* name) {
+			if (!isNumberedFamilyMember(name, prefix, prefixLength)) {
+				return;
+			}
+			if (highest.isEmpty() || strcmpspecial(name, highest.get()) > 0) {
+				highest.set(name); // On failure we keep the previous maximum, which is still a valid floor.
+			}
+		});
+
+		return highest.isEmpty() ? std::string{} : std::string{highest.get()};
+	}
+
+	uint32_t takenLetterSuffixes(char const* stem) const override {
+		uint32_t taken = 0;
+		surveyCard(stem, nullptr, &taken);
+
+		int32_t stemLength = strlen(stem);
+		forEachFileItem([&](char const* name) {
+			int32_t letter = letterVariationOf(name, stem, stemLength);
+			if (letter >= 0) {
+				taken |= 1U << letter;
+			}
+		});
+
+		return taken;
+	}
+
+private:
+	static void surveyCard(char const* stem, String* highestNumbered, uint32_t* takenLetters) {
+		if (Browser::fileItemsAreComplete()) {
+			return; // The folder is already in memory in full - no reason to go back to the card for it.
+		}
+		// A survey that errors part-way still reports what it had found, and neither summary can overstate the
+		// truth, so it is worth more than nothing.
+		(void)Browser::surveyNameVariations(stem, highestNumbered, takenLetters);
+	}
+
+	template <typename Fn>
+	static void forEachFileItem(Fn&& consider) {
+		for (int32_t i = 0; i < Browser::fileItems.getNumElements(); i++) {
+			FileItem* item = (FileItem*)Browser::fileItems.getElementAddress(i);
+			if (!item->isFolder) {
+				consider(item->displayName);
+			}
+		}
+	}
+};
+} // namespace
+
+// If OLED, then you should make sure renderUIsForOLED() gets called after this.
+// outputTypeToLoad must be set before calling this.
+Error Browser::arrivedInNewFolder(int32_t direction, char const* filenameToStartAt, char const* defaultDirToAlsoTry) {
+	arrivedAtFileByTyping = false;
+
+	if (!qwertyAlwaysVisible) {
+		qwertyVisible = false;
+	}
+
+	shouldInterpretNoteNames = shouldInterpretNoteNamesForThisBrowser;
+	octaveStartsFromA = false;
+
+tryReadingItems:
+	bool doWeHaveASearchString = (filenameToStartAt && *filenameToStartAt);
+	int32_t newCatalogSearchDirection = doWeHaveASearchString ? CATALOG_SEARCH_BOTH : CATALOG_SEARCH_RIGHT;
+	Error error =
+	    readFileItemsFromFolderAndMemory(currentSong, outputTypeToLoad, filePrefix, filenameToStartAt,
+	                                     defaultDirToAlsoTry, true, Availability::ANY, newCatalogSearchDirection);
+	if (error != Error::NONE) {
+gotErrorAfterAllocating:
+		emptyFileItems();
+		return error;
+	}
+
+	enteredTextEditPos = 0;
+	if (display->haveOLED()) {
+		scrollPosHorizontal = 0;
+	}
+
+	bool foundExact = false;
+	if (fileItems.getNumElements()) {
+		fileIndexSelected = 0;
+
+		if (!doWeHaveASearchString) {
+noExactFileFound:
+			// We did not find exact file.
+			// Normally, we'll need to just use one of the ones we found. (That's just always the first one, I think...)
+			if (!mayDefaultToBrandNewNameOnEntry || direction) {
+
+				// But since we're going to just use the first file, if we've deleted items at the start (meaning we had
+				// a search string), we need to go back and get them.
+				if (numFileItemsDeletedAtStart) {
+					filenameToStartAt = NULL;
+					goto tryReadingItems;
+				}
+setEnteredTextAndUseFoundFile:
+				error = setEnteredTextFromCurrentFilename();
+				if (error != Error::NONE) {
+					goto gotErrorAfterAllocating;
+				}
+useFoundFile:
+				scrollPosVertical = fileIndexSelected;
+				// Starting in the middle or end of a short folder should still fill as many display rows as possible.
+				clampFileSelectionAndScroll();
+
+				goto everythingFinalized;
+			}
+
+			// But sometimes...
+			else {
+				// Ok so we didn't find an exact file, we've just entered the browser, and we're allowed new names.
+				// So, choose a brand new name (if there wasn't already a new one nominated).
+				goto pickBrandNewNameIfNoneNominated;
+			}
+		}
+
+		int32_t i = fileItems.search(filenameToStartAt, &foundExact);
+		if (!foundExact) {
+			goto noExactFileFound;
+		}
+
+		fileIndexSelected = i;
+
+		// Usually we'll just use that file.
+		if (!mayDefaultToBrandNewNameOnEntry || direction) {
+			goto setEnteredTextAndUseFoundFile;
+		}
+
+		// We found an exact file. But if we've just entered the Browser and are allowed, then we need to find a new
+		// subslot variation. Come up with a new name variation.
+		error = setEnteredTextFromCurrentFilename();
+		if (error != Error::NONE) {
+			goto gotErrorAfterAllocating;
+		}
+		// Come up with a new name variation. Names are display-agnostic ("SONG185", never "185"), so this is one
+		// code path for both displays - see default_name.h.
+		{
+			BrowserFileListView view;
+			// Only songs earn letter suffixes; presets pass an empty slotPrefix and take the numeric suffix path,
+			// preserving existing preset behaviour.
+			char const* slotPrefix = (filePrefix && !memcasecmp(filePrefix, "SONG", 4)) ? filePrefix : "";
+			std::string newName = deluge::gui::browser::nextDefaultName(enteredText.get(), slotPrefix, view);
+			if (newName == enteredText.get()) {
+				goto useFoundFile; // No free variation available - stay on the file we found.
+			}
+			error = enteredText.set(newName.c_str());
+			if (error != Error::NONE) {
+				goto gotErrorAfterAllocating;
+			}
+			enteredTextEditPos = enteredText.getLength();
+		}
+	}
+
+	// Or if no files found at all...
+	else {
+		// Can we just pick a brand new name?
+		if (mayDefaultToBrandNewNameOnEntry && !direction) {
+pickBrandNewNameIfNoneNominated:
+			if (enteredText.isEmpty()) {
+				error = getUnusedSlot(OutputType::NONE, &enteredText, filePrefix);
+				if (error != Error::NONE) {
+					goto gotErrorAfterAllocating;
+				}
+				// Note - this is only hit if we're saving the first song created on boot (because the default name
+				// won't match anything) Because that will have cleared out all the FileItems, we need to get them
+				// again. Actually there would kinda be a way around doing this...
+				error = readFileItemsFromFolderAndMemory(currentSong, OutputType::NONE, "SONG", enteredText.get(), NULL,
+				                                         true, Availability::ANY, CATALOG_SEARCH_BOTH);
+				if (error != Error::NONE) {
+					goto gotErrorAfterAllocating;
+				}
+			}
+		}
+		else {
+			enteredText.clear();
+		}
+	}
+
+useNonExistentFileName:     // Normally this will get skipped over - if we found a file.
+	fileIndexSelected = -1; // No files.
+	scrollPosVertical = 0;
+
+everythingFinalized:
+	folderContentsReady(direction);
+
+	if (display->have7SEG()) {
+		displayText();
+	}
+	return Error::NONE;
+}
+
+// You must set currentDir before calling this.
+Error Browser::getUnusedSlot(OutputType outputType, String* newName, char const* thingName) {
+
+	Error error;
+	// Names always carry the prefix now, on both displays, so there is one search key.
+	// Sean: thingName is usually max 4 chars (e.g. SONG, SYNT, KIT), but can be longer
+	// - e.g. "PATTERN" with pattern browser or "MIDIDEVICE" with midi device definition browser.
+	// it's used for proposing the file name and on 7SEG if you type a # it will prefix it
+	uint8_t buffer_size = 20;
+	char filenameToStartAt[buffer_size];
+	strncpy(filenameToStartAt, thingName, buffer_size - 2); // Leave 2 chars for "colon + null terminator"
+	strcat(filenameToStartAt, ":");                         // Colon is the first character after the digits.
+	error = readFileItemsFromFolderAndMemory(currentSong, outputType, getThingName(outputType), filenameToStartAt, NULL,
+	                                         false, Availability::ANY, CATALOG_SEARCH_LEFT);
+
+	if (error != Error::NONE) {
+doReturn:
+		return error;
+	}
+
+	sortFileItems();
+
+	{
+		int32_t freeSlotNumber = 1;
+		int32_t minNumDigits = 1;
+		if (fileItems.getNumElements()) {
+			FileItem* fileItem = (FileItem*)fileItems.getElementAddress(fileItems.getNumElements() - 1);
+			String filename;
+			error = fileItem->getFilenameWithoutExtension(&filename);
+			if (error != Error::NONE) {
+				goto emptyFileItemsAndReturn;
+			}
+			char const* readingChar = &filename.get()[strlen(thingName)];
+			freeSlotNumber = 0;
+			minNumDigits = 0;
+			while (*readingChar >= '0' && *readingChar <= '9') {
+				freeSlotNumber *= 10;
+				freeSlotNumber += *readingChar - '0';
+				minNumDigits++;
+				readingChar++;
+			}
+			freeSlotNumber++;
+		}
+
+		error = newName->set(thingName);
+		if (error != Error::NONE) {
+			goto emptyFileItemsAndReturn;
+		}
+		error = newName->concatenateInt(freeSlotNumber, minNumDigits);
+	}
+
+emptyFileItemsAndReturn:
+	emptyFileItems();
+	goto doReturn;
+}
+
+Error Browser::surveyNameVariations(char const* stem, String* highestNumbered, uint32_t* takenLetters) {
+	if (highestNumbered) {
+		highestNumbered->clear();
+	}
+	if (takenLetters) {
+		*takenLetters = 0;
+	}
+
+	Error error = StorageManager::initSD();
+	if (error != Error::NONE) {
+		return error;
+	}
+
+	staticDIR =
+	    D_TRY_CATCH(FatFS::Directory::open(currentDir.get()), fatError, { return fatfsErrorToDelugeError(fatError); });
+
+	int32_t stemLength = strlen(stem);
+
+	while (true) {
+		audioFileManager.loadAnyEnqueuedClusters();
+
+		staticFNO = D_TRY_CATCH(staticDIR.read(), fatError, {
+			error = fatfsErrorToDelugeError(fatError);
+			break;
+		});
+
+		if (staticFNO.fname[0] == 0) {
+			break; /* End of dir */
+		}
+		if (staticFNO.fname[0] == '.' || (staticFNO.fattrib & AM_DIR)) {
+			continue; // Dot entry, or a folder - only files carry these names.
+		}
+		if (!isAllowedFileExtension(staticFNO.fname, allowedFileExtensions)) {
+			continue;
+		}
+
+		if (highestNumbered && isNumberedFamilyMember(staticFNO.fname, stem, stemLength)) {
+			// strcmpspecial compares digit runs numerically, so this finds the highest *number*, not the longest
+			// name: "MYTRACK 11.XML" beats "MYTRACK 9.XML".
+			if (highestNumbered->isEmpty() || strcmpspecial(staticFNO.fname, highestNumbered->get()) > 0) {
+				error = highestNumbered->set(staticFNO.fname);
+				if (error != Error::NONE) {
+					break;
+				}
+			}
+		}
+
+		if (takenLetters) {
+			int32_t letter = letterVariationOf(staticFNO.fname, stem, stemLength);
+			if (letter >= 0) {
+				*takenLetters |= 1U << letter;
+			}
+		}
+	}
+
+	staticDIR.close();
+	return error;
+}
+
+void Browser::selectEncoderAction(int8_t offset) {
+	arrivedAtFileByTyping = false;
+
+	if (currentUIMode != UI_MODE_NONE && currentUIMode != UI_MODE_HORIZONTAL_SCROLL) {
+		return; // This was from SampleBrowser. Is it still necessary?
+	}
+
+	shouldInterpretNoteNames = shouldInterpretNoteNamesForThisBrowser;
+	octaveStartsFromA = false;
+
+	int32_t newFileIndex;
+
+	if (fileIndexSelected < 0) { // If no file selected and we were typing a new name?
+		if (!fileItems.getNumElements()) {
+			return;
+		}
+
+		newFileIndex = fileItems.search(enteredText.get());
+		if (offset < 0) {
+			newFileIndex--;
+		}
+	}
+	else {
+		// If user is holding shift, skip past any subslots. And the user may have chosen one digit to "edit" (7SEG
+		// only - numberEditPos is -1 otherwise).
+		//
+		// Names always carry the file prefix, so there is one path here, not one per display. (The two branches this
+		// replaced were each written for the *other* display's convention, leaving both dead.)
+		int32_t numberEditPosNow = numberEditPos;
+		if (Buttons::isShiftButtonPressed() && numberEditPosNow == -1) {
+			numberEditPosNow = 0;
+		}
+
+		if (numberEditPosNow != -1) {
+			char const* numberPart = nameAfterPrefix(enteredText.get());
+			if (!numberPart) {
+				goto nonNumeric;
+			}
+			Slot thisSlot = getSlot(numberPart);
+			if (thisSlot.slot < 0) {
+				goto nonNumeric;
+			}
+			thisSlot.subSlot = -1;
+
+			switch (numberEditPosNow) {
+			case 0:
+				thisSlot.slot += offset;
+				break;
+
+			case 1:
+				thisSlot.slot = (thisSlot.slot / 10 + offset) * 10;
+				break;
+
+			case 2:
+				thisSlot.slot = (thisSlot.slot / 100 + offset) * 100;
+				break;
+
+			default:
+				__builtin_unreachable();
+			}
+
+			int32_t filePrefixLength = strlen(filePrefix);
+			char searchString[16];
+			memcpy(searchString, filePrefix, filePrefixLength);
+			char* searchStringNumbersStart = searchString + filePrefixLength;
+			intToString(thisSlot.slot, searchStringNumbersStart, 1);
+			if (offset < 0) {
+				char* pos = strchr(searchStringNumbersStart, 0);
+				*pos = 'A';
+				pos++;
+				*pos = 0;
+			}
+			newFileIndex = fileItems.search(searchString);
+			if (offset < 0) {
+				newFileIndex--;
+			}
+		}
+		else {
+nonNumeric:
+			newFileIndex = fileIndexSelected + offset;
+		}
+	}
+
+	int32_t newCatalogSearchDirection;
+	Error error;
+
+	if (newFileIndex < 0) {
+		D_PRINTLN("index below 0");
+		if (numFileItemsDeletedAtStart) {
+			scrollPosVertical = 9999;
+
+tryReadingItems:
+			D_PRINTLN("reloading");
+			error = readFileItemsFromFolderAndMemory(currentSong, outputTypeToLoad, filePrefix, enteredText.get(), NULL,
+			                                         true, Availability::ANY, CATALOG_SEARCH_BOTH);
+			if (error != Error::NONE) {
+gotErrorAfterAllocating:
+				D_PRINTLN("error while reloading, emptying file items");
+				emptyFileItems();
+				return;
+				// TODO - need to close UI or something?
+			}
+
+			newFileIndex = fileItems.search(enteredText.get()) + offset;
+			D_PRINTLN("new file Index is %d", newFileIndex);
+		}
+
+		else if (!shouldWrapFolderContents && display->have7SEG()) {
+			return;
+		}
+
+		else { // Wrap to end
+			scrollPosVertical = 0;
+
+			if (numFileItemsDeletedAtEnd) {
+				newCatalogSearchDirection = CATALOG_SEARCH_LEFT;
+searchFromOneEnd:
+				D_PRINTLN("reloading and wrap");
+				error =
+				    readFileItemsFromFolderAndMemory(currentSong, outputTypeToLoad, filePrefix, NULL, NULL, true,
+				                                     Availability::ANY, newCatalogSearchDirection); // Load from start
+				if (error != Error::NONE) {
+					goto gotErrorAfterAllocating;
+				}
+
+				newFileIndex =
+				    (newCatalogSearchDirection == CATALOG_SEARCH_LEFT) ? (fileItems.getNumElements() - 1) : 0;
+			}
+			else {
+				newFileIndex = fileItems.getNumElements() - 1;
+			}
+		}
+	}
+
+	else if (newFileIndex >= fileItems.getNumElements()) {
+		D_PRINTLN("out of file items");
+		if (numFileItemsDeletedAtEnd) {
+			scrollPosVertical = 0;
+			goto tryReadingItems;
+		}
+
+		else if (!shouldWrapFolderContents && display->have7SEG()) {
+			return;
+		}
+
+		else {
+			scrollPosVertical = 9999;
+
+			if (numFileItemsDeletedAtStart) {
+				newCatalogSearchDirection = CATALOG_SEARCH_RIGHT;
+				goto searchFromOneEnd;
+			}
+			else {
+				newFileIndex = 0;
+			}
+		}
+	}
+
+	if (!qwertyAlwaysVisible) {
+		qwertyVisible = false;
+	}
+
+	fileIndexSelected = newFileIndex;
+	// A fast turn may be delivered as a multi-file offset; after a folder-window re-read, that offset can still
+	// overshoot.
+	clampFileSelectionAndScroll(false);
+	if (fileIndexSelected == -1) {
+		return;
+	}
+
+	enteredTextEditPos = 0;
+	if (display->haveOLED()) {
+		scrollPosHorizontal = 0;
+	}
+	else {
+		char const* oldCharAddress = enteredText.get();
+		char const* newCharAddress = getCurrentFileItem()->displayName; // Will have file extension, so beware...
+		while (true) {
+			char oldChar = *oldCharAddress;
+			char newChar = *newCharAddress;
+
+			if (oldChar >= 'A' && oldChar <= 'Z') {
+				oldChar += 32;
+			}
+			if (newChar >= 'A' && newChar <= 'Z') {
+				newChar += 32;
+			}
+
+			if (oldChar != newChar) {
+				break;
+			}
+			oldCharAddress++;
+			newCharAddress++;
+			enteredTextEditPos++;
+		}
+	}
+
+	error = setEnteredTextFromCurrentFilename();
+	if (error != Error::NONE) {
+		display->displayError(error);
+		return;
+	}
+
+	displayText();
+	// currentFileChanged uses the value as a scroll-animation direction, so give it only the sign.
+	currentFileChanged(offset > 0 ? 1 : (offset < 0 ? -1 : 0));
+}
+
+bool Browser::predictExtendedText() {
+	Error error;
+	arrivedAtFileByTyping = true;
+	shouldInterpretNoteNames = shouldInterpretNoteNamesForThisBrowser;
+	octaveStartsFromA = false;
+
+	// Names always carry the file prefix, but on 7SEG the user only ever sees and types the number ("185"). When
+	// typing begins with a digit, treat the prefix as implicitly typed - otherwise "1" would match nothing. The typed
+	// portion of enteredText is [0, enteredTextEditPos), so the prefix has to go *into* enteredText and be counted,
+	// not merely prepended to the search key.
+	if (display->have7SEG() && filePrefix && enteredTextEditPos > 0) {
+		char const* typed = enteredText.get();
+		if (typed[0] >= '0' && typed[0] <= '9') {
+			int32_t prefixLength = strlen(filePrefix);
+			String prefixed;
+			error = prefixed.set(filePrefix);
+			if (error == Error::NONE) {
+				error = prefixed.concatenate(&enteredText);
+			}
+			if (error != Error::NONE) {
+				// Must not advance enteredTextEditPos here: it indexes into enteredText, and a short/stale string with
+				// an advanced edit pos would make the shorten() and memcasecmp() below read out of bounds.
+				display->displayError(error);
+				return false;
+			}
+			enteredText.set(&prefixed); // Cannot fail - takes ownership of the already-allocated buffer.
+			enteredTextEditPos += prefixLength;
+		}
+	}
+
+	FileItem* oldFileItem = getCurrentFileItem();
+	DWORD oldClust = 0;
+	if (oldFileItem) {
+		oldClust = oldFileItem->filePointer.sclust;
+	}
+
+	String searchString;
+	searchString.set(&enteredText);
+	bool doneNewRead = false;
+	error = searchString.shorten(enteredTextEditPos);
+	if (error != Error::NONE) {
+gotError:
+		display->displayError(error);
+		return false;
+	}
+
+	int32_t numExtraZeroesAdded = 0;
+
+	// Change 2026-03-29 - this code used to append a tilde to the search string. The tilde would match after all
+	// printable characters so it would return 1 greater than the index of the search result we wanted. unfortunately
+	// for reasons I don't fully understand (7seg compatibility maybe?) multi digit integers are compared as one number
+	// rather than character by character, so if you had files named "SONG1", "SONG2", "SONG10", and you typed in
+	// "SONG1", and then pressed the encoder to try to get it to predict "SONG10", it would instead match "SONG2"
+	// because 2 is the closest number to 1 that comes after 1. So now we just search for the string as is. The major
+	// impact is this now returns the first match instead of the last match.
+doSearch:
+	int32_t i = fileItems.search(searchString.get());
+
+	// If that search takes us off the right-hand end of the list...
+	if (i >= fileItems.getNumElements()) {
+
+		// If we haven't yet done a whole new read from the SD card etc, from within this function, do that now.
+		if (!doneNewRead) {
+doNewRead:
+			doneNewRead = true;
+			error = readFileItemsFromFolderAndMemory(
+			    currentSong, outputTypeToLoad, filePrefix, searchString.get(), NULL, true, Availability::ANY,
+			    CATALOG_SEARCH_BOTH); // This could probably actually be made to work with searching left only...
+			if (error != Error::NONE) {
+gotErrorAfterAllocating:
+				emptyFileItems();
+				goto gotError;
+				// TODO - need to close UI or something?
+			}
+			goto doSearch;
+		}
+
+		// Otherwise if we already tried that, then our whole search is fruitless.
+notFound:
+		if (display->haveOLED() && !mayDefaultToBrandNewNameOnEntry) {
+			if (fileIndexSelected >= 0) {
+				setEnteredTextFromCurrentFilename(); // Set it back
+			}
+			return false;
+		}
+
+		fileIndexSelected = -1;
+		return true;
+	}
+
+	// The search returns the index where searchString would be inserted
+	// Now check if the file at index i actually matches our prefix. Covers any shenanigans with the weird string
+	// matching
+	FileItem* fileItem = (FileItem*)fileItems.getElementAddress(i);
+
+	// If it didn't match exactly, that's ok, but we need to try some other stuff before we accept that result.
+	if (memcasecmp(fileItem->displayName, enteredText.get(), enteredTextEditPos)) {
+		// If the search landed on the first cached item, the folder cache may be missing earlier entries.
+		if (i == 0 && !doneNewRead) {
+			goto doNewRead;
+		}
+
+		// this code is original but I don't know what it does. Slot browser maybe?
+		// Just updated to append to the string instead of replacing the tilde
+		if (numExtraZeroesAdded < 4) {
+			error = searchString.concatenateAtPos("0", searchString.getLength(), 1);
+			if (error != Error::NONE) {
+				goto gotError;
+			}
+			numExtraZeroesAdded++;
+			doneNewRead = false;
+			goto doSearch;
+		}
+		else {
+			goto notFound;
+		}
+	}
+
+	fileIndexSelected = i;
+
+	// Typing/prediction can land on a cached item without needing to move the viewport unless it is offscreen.
+	clampFileSelectionAndScroll();
+
+	error = setEnteredTextFromCurrentFilename();
+	if (error != Error::NONE) {
+		goto gotError;
+	}
+
+	displayText();
+
+	// If we're now on a different file than before, preview it
+	if (fileItem->filePointer.sclust != oldClust) {
+		currentFileChanged(0);
+	}
+
+	return true;
+}
+
+void Browser::currentFileDeleted() {
+	FileItem* currentFileItem = getCurrentFileItem();
+	if (!currentFileItem) {
+		return; // Shouldn't happen...
+	}
+	if (currentFileItem->instrument && !currentFileItem->instrumentAlreadyInSong) {
+		currentFileItem->instrument->shouldHibernate = false;
+	}
+	currentFileItem->~FileItem();
+
+	fileItems.deleteAtIndex(fileIndexSelected);
+
+	if (fileIndexSelected == fileItems.getNumElements()) {
+		fileIndexSelected--; // It might go to -1 if no files left.
+		enteredText.clear();
+		enteredTextEditPos = 0;
+	}
+	else {
+		setEnteredTextFromCurrentFilename();
+	}
+	// Deleting the last visible item can leave the top row past the new end of the list.
+	clampFileSelectionAndScroll();
+	currentFileChanged(0);
+}
+
+void Browser::renderOLED(deluge::hid::display::oled_canvas::Canvas& canvas) {
+	canvas.drawScreenTitle(title);
+
+	int32_t textStartX = 14;
+	int32_t iconStartX = 1;
+	if (FlashStorage::accessibilityMenuHighlighting == MenuHighlighting::NO_INVERSION) {
+		textStartX += kTextSpacingX;
+		iconStartX = kTextSpacingX;
+	}
+
+	int32_t yPixel = (OLED_MAIN_HEIGHT_PIXELS == 64) ? 15 : 14;
+	yPixel += OLED_MAIN_TOPMOST_PIXEL;
+
+	int32_t maxChars = (uint32_t)(OLED_MAIN_WIDTH_PIXELS - textStartX) / (uint32_t)kTextSpacingX;
+
+	bool isFolder = false;
+	bool isSelectedIndex = true;
+	char const* displayName;
+	int32_t o;
+	// Use the display contract for browser/menu rows instead of assuming the OLED character-grid height.
+	int32_t visibleRows = display->getNumBrowserAndMenuLines();
+	if (visibleRows < 1) {
+		visibleRows = 1;
+	}
+
+	// If we're currently typing a filename which doesn't (yet?) have a file...
+	if (fileIndexSelected == -1) {
+		displayName = enteredText.get();
+		o = visibleRows; // Make sure below loop doesn't keep looping.
+		goto drawAFile;
+	}
+
+	else {
+		for (o = 0; o < visibleRows; o++) {
+			{
+				int32_t i = o + scrollPosVertical;
+
+				if (i >= fileItems.getNumElements()) {
+					break;
+				}
+
+				FileItem* thisFile = (FileItem*)fileItems.getElementAddress(i);
+				isFolder = thisFile->isFolder;
+				displayName = thisFile->filename.get();
+				isSelectedIndex = (i == fileIndexSelected);
+			}
+drawAFile:
+			// Draw graphic
+			int32_t iconWidth = 8;
+			uint8_t const* graphic = isFolder ? deluge::hid::display::OLED::folderIcon : fileIcon;
+			canvas.drawGraphicMultiLine(graphic, iconStartX, yPixel + 0, iconWidth);
+			if (!isFolder && fileIconPt2 && fileIconPt2Width) {
+				canvas.drawGraphicMultiLine(fileIconPt2, iconStartX + iconWidth, yPixel + 0, fileIconPt2Width);
+			}
+
+			// Draw filename
+			char finalChar = isFolder ? 0 : '.';
+searchForChar:
+			char const* finalCharAddress = strrchr(displayName, finalChar);
+			if (!finalCharAddress) { // Shouldn't happen... or maybe for in-memory presets?
+				finalChar = 0;
+				goto searchForChar;
+			}
+
+			int32_t displayStringLength = (uintptr_t)finalCharAddress - (uintptr_t)displayName;
+
+			if (isSelectedIndex) {
+				drawTextForOLEDEditing(textStartX, OLED_MAIN_WIDTH_PIXELS, yPixel, maxChars, canvas);
+				if (!enteredTextEditPos) {
+					deluge::hid::display::OLED::setupSideScroller(0, enteredText.get(), textStartX,
+					                                              OLED_MAIN_WIDTH_PIXELS, yPixel, yPixel + 8,
+					                                              kTextSpacingX, kTextSpacingY, true);
+				}
+			}
+			else {
+				canvas.drawString(std::string_view{displayName, static_cast<size_t>(displayStringLength)}, textStartX,
+				                  yPixel, kTextSpacingX, kTextSpacingY);
+			}
+
+			yPixel += kTextSpacingY;
+		}
+	}
+}
+
+void Browser::clampFileSelectionAndScroll(bool allowNoFileSelection) {
+	int32_t numFileItems = fileItems.getNumElements();
+	if (numFileItems <= 0) {
+		// No cached files means there is no real selection, and the viewport must reset to the top.
+		fileIndexSelected = -1;
+		scrollPosVertical = 0;
+		return;
+	}
+
+	if (fileIndexSelected >= numFileItems) {
+		// A large encoder offset can overshoot the freshly cached window; land on the last cached item instead.
+		fileIndexSelected = numFileItems - 1;
+	}
+	else if (fileIndexSelected < 0) {
+		// -1 is valid only while typing a new name; encoder browsing must stay on a real cached file.
+		fileIndexSelected = allowNoFileSelection ? -1 : 0;
+	}
+
+	// Fast encoder turns can arrive as multi-file jumps after the cached folder window has been re-read.
+	// Keep both the selection and the visible window inside the files we actually have.
+	int32_t visibleRows = display->getNumBrowserAndMenuLines();
+	if (visibleRows < 1) {
+		// Defensive fallback for mock or future displays; the scroll math needs at least one visible row.
+		visibleRows = 1;
+	}
+	int32_t lastAllowedScroll = numFileItems - visibleRows;
+	if (lastAllowedScroll < 0) {
+		// Short folders cannot fill every row, so their top visible row is always the first item.
+		lastAllowedScroll = 0;
+	}
+
+	if (fileIndexSelected == -1) {
+		// While typing a new name, the rendered row is enteredText rather than an item from fileItems.
+		scrollPosVertical = 0;
+		return;
+	}
+
+	if (scrollPosVertical > fileIndexSelected) {
+		// The selected item is above the current viewport; move it to the first visible row.
+		scrollPosVertical = fileIndexSelected;
+	}
+	else if (scrollPosVertical < fileIndexSelected - visibleRows + 1) {
+		// The selected item is below the current viewport; move it to the last visible row.
+		scrollPosVertical = fileIndexSelected - visibleRows + 1;
+	}
+
+	if (scrollPosVertical > lastAllowedScroll) {
+		// Keep the viewport from starting so low that the bottom browser rows would be blank.
+		scrollPosVertical = lastAllowedScroll;
+	}
+	if (scrollPosVertical < 0) {
+		// Short-folder and typing cases can make the intermediate top row negative; clamp back to the start.
+		scrollPosVertical = 0;
+	}
+}
+
+// Names always carry the file prefix (e.g. "SONG185"). Only rendering strips it, so anything wanting the numeric part
+// goes through here first. Zero-padding is skipped too - getSlot() cannot parse "001". See default_name.h.
+char const* Browser::nameAfterPrefix(char const* name) const {
+	return deluge::gui::browser::numberPartOf(name, filePrefix);
+}
+
+// Supply a string with no prefix (e.g. SONG), and no file extension.
+// If name is non-numeric, a slot of -1 will be returned.
+Slot Browser::getSlot(char const* displayName) {
+
+	char const* charPos = displayName;
+	if (*charPos == '0') { // If first digit is 0, then no more digits allowed.
+		charPos++;
+	}
+	else { // Otherwise, up to 3 digits allowed.
+		while (*charPos >= '0' && *charPos <= '9' && charPos < (displayName + 3)) {
+			charPos++;
+		}
+	}
+
+	int32_t numDigitsFound = charPos - displayName;
+
+	Slot toReturn;
+
+	if (!numDigitsFound) { // We are required to have found at least 1 digit.
+nonNumeric:
+		toReturn.slot = -1;
+doReturn:
+		return toReturn;
+	}
+
+	char thisSlotNumber[4];
+	memcpy(thisSlotNumber, displayName, numDigitsFound);
+	thisSlotNumber[numDigitsFound] = 0;
+	toReturn.slot = stringToInt(thisSlotNumber);
+
+	// Get the file's subslot
+	uint8_t subSlotChar = *charPos;
+	switch (subSlotChar) {
+
+	case 'a' ... 'z':
+		subSlotChar -= 32;
+		// No break.
+
+	case 'A' ... 'Z': {
+		toReturn.subSlot = subSlotChar - 'A';
+		charPos++;
+		char nextChar = *charPos;
+		if (nextChar) {
+			goto nonNumeric; // Ensure no more characters
+		}
+		break;
+	}
+
+		// case '.':
+		// if (strchr(charPos + 1, '.')) goto nonNumeric; // Ensure no more dots after this dot.
+		//  No break.
+
+	case 0:
+		toReturn.subSlot = -1;
+		break;
+
+	default:
+		goto nonNumeric; // Ensure no more characters
+	}
+
+	goto doReturn;
+}
+
+void Browser::displayText(bool blinkImmediately) {
+	if (display->haveOLED()) {
+		renderUIsForOled();
+	}
+	else {
+		if (arrivedAtFileByTyping || qwertyVisible) {
+			if (!arrivedAtFileByTyping) {
+				// This means a key has been hit while browsing
+				// to bring up the keyboard, so set position to -1
+				// this might not be neccesary?
+				numberEditPos = -1;
+			}
+			QwertyUI::displayText(blinkImmediately);
+		}
+		else {
+			if (enteredText.isEmpty() && fileIndexSelected == -1) {
+				display->setText("----");
+			}
+			else {
+				// A name is always the full on-card name ("SONG185"). On 7SEG we render the numeric part alone
+				// ("185") so it fits the four-character display.
+				char const* numberPart = nameAfterPrefix(enteredText.get());
+				if (numberPart) {
+
+					Slot thisSlot = getSlot(numberPart);
+					if (thisSlot.slot >= 0) {
+						display->setTextAsSlot(thisSlot.slot, thisSlot.subSlot, (fileIndexSelected != -1), true,
+						                       numberEditPos, blinkImmediately);
+						return;
+					}
+				}
+				int16_t scrollStart = enteredTextEditPos;
+				// if the first difference would be visible on
+				// screen anyway, start scroll from the beginning
+				if (enteredTextEditPos < 3) {
+					scrollStart = 0;
+				}
+				else {
+					// provide some context in case the post-fix is long
+					scrollStart = enteredTextEditPos - 2;
+				}
+				FileItem* currentFileItem = getCurrentFileItem();
+				bool currentItemIsFolder = currentFileItem && currentFileItem->isFolder;
+				auto dotPos = currentItemIsFolder ? 3 : 255;
+				scrollingText = display->setScrollingText(enteredText.get(), scrollStart, 600, -1, dotPos);
+			}
+		}
+	}
+}
+
+FileItem* Browser::getCurrentFileItem() {
+	if (fileIndexSelected == -1) {
+		return nullptr;
+	}
+	return (FileItem*)fileItems.getElementAddress(fileIndexSelected);
+}
+
+// This and its individual contents are frequently overridden by child classes.
+ActionResult Browser::buttonAction(deluge::hid::Button b, bool on, bool inCardRoutine) {
+	using namespace deluge::hid::button;
+
+	// Select encoder
+	if (b == SELECT_ENC) {
+		return mainButtonAction(on);
+	}
+
+	// Save button, to delete file
+	else if (b == SAVE && Buttons::isShiftButtonPressed()) {
+		if (!currentUIMode && on) {
+			FileItem* currentFileItem = getCurrentFileItem();
+			if (currentFileItem) {
+				if (currentFileItem->isFolder) {
+					display->displayPopup(
+					    deluge::l10n::get(deluge::l10n::String::STRING_FOR_FOLDERS_CANNOT_BE_DELETED_ON_THE_DELUGE));
+					return ActionResult::DEALT_WITH;
+				}
+				if (inCardRoutine) {
+					return ActionResult::REMIND_ME_OUTSIDE_CARD_ROUTINE;
+				}
+				// deletes the underlying item
+				goIntoDeleteFileContextMenu();
+			}
+		}
+	}
+
+	// Back button
+	else if (b == BACK) {
+		if (on && !currentUIMode) {
+			return backButtonAction();
+		}
+	}
+	else {
+		return ActionResult::NOT_DEALT_WITH;
+	}
+
+	return ActionResult::DEALT_WITH;
+}
+
+ActionResult Browser::padAction(int32_t x, int32_t y, int32_t on) {
+	bool inFavouriteOrBanksColumn = (x >= 0 && x < static_cast<int32_t>(kNumFavourites));
+
+	if (isFavouritesVisible() && inFavouriteOrBanksColumn && y == favouriteRow) {
+		if (on) {
+			if (sdRoutineLock) {
+				return ActionResult::REMIND_ME_OUTSIDE_CARD_ROUTINE;
+			}
+			if (Buttons::isShiftButtonPressed()) {
+				String filePath;
+				Error error = getCurrentFilePath(&filePath);
+				if (error != Error::NONE) {
+					display->displayPopup(l10n::get(l10n::String::STRING_FOR_ERROR_FILE_NOT_FOUND));
+				}
+				if (favouritesManager.isEmpty(x)) {
+					if (!getCurrentFileItem()->isFolder) {
+						favouritesManager.setFavourite(x, FavouritesManager::favouriteDefaultColor, filePath.get());
+						favouritesChanged();
+					}
+				}
+				else {
+					favouritesManager.unsetFavourite(x);
+					favouritesChanged();
+				}
+			}
+			else {
+				const std::string favouritePath = favouritesManager.getFavouriteFilename(x);
+				favouritesChanged();
+				if (!favouritePath.empty()) {
+					setFileByFullPath(outputTypeToLoad, favouritePath.c_str());
+				}
+				else {
+					display->displayPopup(l10n::get(l10n::String::STRING_FOR_FAVOURITES_EMPTY));
+				}
+			}
+		}
+		return ActionResult::DEALT_WITH;
+	}
+	else if (isBanksVisible() && inFavouriteOrBanksColumn && y == favouriteBankRow) {
+		if (on) {
+			if (sdRoutineLock) {
+				return ActionResult::REMIND_ME_OUTSIDE_CARD_ROUTINE;
+			}
+			favouritesManager.selectFavouritesBank(x);
+			favouritesChanged();
+			return ActionResult::DEALT_WITH;
+		}
+	}
+	else {
+		return QwertyUI::padAction(x, y, on);
+	}
+	return ActionResult::DEALT_WITH;
+}
+
+void Browser::favouritesChanged() {
+	renderFavourites();
+}
+
+ActionResult Browser::verticalEncoderAction(int32_t offset, bool inCardRoutine) {
+	if (isFavouritesVisible()) {
+		if (Buttons::isShiftButtonPressed()) {
+			if (favouritesManager.currentFavouriteNumber.has_value()) {
+				favouritesManager.changeColour(favouritesManager.currentFavouriteNumber.value(), offset);
+				favouritesChanged();
+			}
+		}
+	}
+	return ActionResult::DEALT_WITH;
+}
+
+ActionResult Browser::mainButtonAction(bool on) {
+	// Press down
+	if (on) {
+		if (currentUIMode == UI_MODE_NONE) {
+			if (sdRoutineLock) {
+				return ActionResult::REMIND_ME_OUTSIDE_CARD_ROUTINE;
+			}
+			uiTimerManager.setTimer(TimerName::UI_SPECIFIC, LONG_PRESS_DURATION);
+			currentUIMode = UI_MODE_HOLDING_BUTTON_POTENTIAL_LONG_PRESS;
+		}
+	}
+
+	// Release press
+	else {
+		if (currentUIMode == UI_MODE_HOLDING_BUTTON_POTENTIAL_LONG_PRESS) {
+			if (sdRoutineLock) {
+				return ActionResult::REMIND_ME_OUTSIDE_CARD_ROUTINE;
+			}
+			currentUIMode = UI_MODE_NONE;
+			uiTimerManager.unsetTimer(TimerName::UI_SPECIFIC);
+			enterKeyPress();
+		}
+	}
+
+	return ActionResult::DEALT_WITH;
+}
+
+// Virtual function - may be overridden, by child classes that need to do more stuff, e.g. SampleBrowser needs to mute
+// any previewing Sample.
+ActionResult Browser::backButtonAction() {
+	if (sdRoutineLock) {
+		return ActionResult::REMIND_ME_OUTSIDE_CARD_ROUTINE;
+	}
+	Error error = goUpOneDirectoryLevel();
+	if (error != Error::NONE) {
+		exitAction();
+	}
+
+	return ActionResult::DEALT_WITH;
+}
+
+// Virtual function - may be overridden, by child classes that need to do more stuff on exit.
+void Browser::exitAction() {
+	close();
+}
+
+void Browser::goIntoDeleteFileContextMenu() {
+	using namespace gui;
+	bool available = context_menu::deleteFile.setupAndCheckAvailability();
+
+	if (available) {
+		display->setNextTransitionDirection(1);
+		openUI(&context_menu::deleteFile);
+	}
+}
+
+Error Browser::setEnteredTextFromCurrentFilename() {
+	FileItem* currentFileItem = getCurrentFileItem();
+
+	Error error = enteredText.set(currentFileItem->displayName);
+	if (error != Error::NONE) {
+		return error;
+	}
+
+	// Cut off the file extension
+	if (!currentFileItem->isFolder) {
+		char const* enteredTextChars = enteredText.get();
+		char const* dotAddress = strrchr(enteredTextChars, '.');
+		if (dotAddress) {
+			int32_t dotPos = (uintptr_t)dotAddress - (uintptr_t)enteredTextChars;
+			error = enteredText.shorten(dotPos);
+			if (error != Error::NONE) {
+				return error;
+			}
+		}
+	}
+
+	return Error::NONE;
+}
+
+Error Browser::goIntoFolder(char const* folderName) {
+	Error error;
+
+	if (!currentDir.isEmpty()) {
+		error = currentDir.concatenate("/");
+		if (error != Error::NONE) {
+			return error;
+		}
+	}
+
+	error = currentDir.concatenate(folderName);
+	if (error != Error::NONE) {
+		return error;
+	}
+
+	enteredText.clear();
+	enteredTextEditPos = 0;
+
+	display->setNextTransitionDirection(1);
+	error = arrivedInNewFolder(1);
+	if (display->haveOLED()) {
+		if (error == Error::NONE) {
+			renderUIsForOled();
+		}
+	}
+
+	return error;
+}
+
+Error Browser::goUpOneDirectoryLevel() {
+
+	char const* currentDirChars = currentDir.get();
+	char const* slashAddress = strrchr(currentDirChars, '/');
+	if (!slashAddress || slashAddress == currentDirChars) {
+		return Error::NO_FURTHER_DIRECTORY_LEVELS_TO_GO_UP;
+	}
+
+	int32_t slashPos = (uintptr_t)slashAddress - (uintptr_t)currentDirChars;
+	Error error = enteredText.set(slashAddress + 1);
+	if (error != Error::NONE) {
+		return error;
+	}
+	currentDir.shorten(slashPos);
+	if (error != Error::NONE) {
+		return error;
+	}
+	enteredTextEditPos = 0;
+
+	display->setNextTransitionDirection(-1);
+	error = arrivedInNewFolder(-1, enteredText.get());
+	if (display->haveOLED()) {
+		if (error == Error::NONE) {
+			renderUIsForOled();
+		}
+	}
+	return error;
+}
+
+Error Browser::createFolder() {
+	displayText();
+
+	String newDirPath;
+	Error error;
+
+	newDirPath.set(&currentDir);
+	if (!newDirPath.isEmpty()) {
+		error = newDirPath.concatenate("/");
+		if (error != Error::NONE) {
+			return error;
+		}
+	}
+
+	error = newDirPath.concatenate(&enteredText);
+	if (error != Error::NONE) {
+		return error;
+	}
+
+	FRESULT result = f_mkdir(newDirPath.get());
+	if (result) {
+		return Error::SD_CARD;
+	}
+
+	error = goIntoFolder(enteredText.get());
+
+	return error;
+}
+
+Error Browser::createFoldersRecursiveIfNotExists(const char* path) {
+	if (!path || *path == '\0') {
+		return Error::UNSPECIFIED;
+	}
+
+	char tempPath[256];
+	size_t len = 0;
+
+	// Iterate through the path and create directories step by step
+	for (const char* p = path; *p; ++p) {
+		tempPath[len++] = *p;
+		tempPath[len] = '\0';
+
+		if (*p == '/' || *(p + 1) == '\0') {
+			FRESULT result = f_mkdir(tempPath);
+			if (result != FR_OK && result != FR_EXIST) {
+				return fresultToDelugeErrorCode(FR_NO_PATH);
+			}
+		}
+	}
+	return Error::NONE;
+}
+
+void Browser::sortFileItems() {
+	shouldInterpretNoteNames = shouldInterpretNoteNamesForThisBrowser;
+	octaveStartsFromA = false;
+
+	fileItems.sortForStrings();
+
+	// If we're just wanting to look to one side or the other of a given filename, then delete everything in the other
+	// direction.
+	if (filenameToStartSearchAt && *filenameToStartSearchAt) {
+
+		if (catalogSearchDirection == CATALOG_SEARCH_LEFT) {
+			bool foundExact;
+			int32_t searchIndex = fileItems.search(filenameToStartSearchAt, &foundExact);
+			// Check for duplicates.
+			if (foundExact) {
+				int32_t prevIndex = searchIndex - 1;
+				if (prevIndex >= 0) {
+					FileItem* prevItem = (FileItem*)fileItems.getElementAddress(prevIndex);
+					if (!strcmpspecial(prevItem->displayName, filenameToStartSearchAt)) {
+						searchIndex = prevIndex;
+					}
+				}
+			}
+			int32_t numToDelete = fileItems.getNumElements() - searchIndex;
+			if (numToDelete > 0) {
+				deleteSomeFileItems(searchIndex, fileItems.getNumElements());
+				numFileItemsDeletedAtEnd += numToDelete;
+			}
+		}
+		else if (catalogSearchDirection == CATALOG_SEARCH_RIGHT) {
+			bool foundExact;
+			int32_t searchIndex = fileItems.search(filenameToStartSearchAt, &foundExact);
+			// Check for duplicates.
+			if (foundExact) {
+				int32_t nextIndex = searchIndex + 1;
+				if (nextIndex < fileItems.getNumElements()) {
+					FileItem* nextItem = (FileItem*)fileItems.getElementAddress(nextIndex);
+					if (!strcmpspecial(nextItem->displayName, filenameToStartSearchAt)) {
+						searchIndex = nextIndex;
+					}
+				}
+			}
+			int32_t numToDelete = searchIndex + (int32_t)foundExact;
+			if (numToDelete > 0) {
+				deleteSomeFileItems(0, numToDelete);
+				numFileItemsDeletedAtStart += numToDelete;
+			}
+		}
+	}
+
+	// If we'd previously deleted items from either end of the list (apart from due to search direction as above),
+	// we need to now delete any items which would have fallen in that region.
+	if (!lastFileItemRemaining.isEmpty()) {
+		int32_t searchIndex = fileItems.search(lastFileItemRemaining.get());
+		int32_t itemsToDeleteAtEnd = fileItems.getNumElements() - searchIndex - 1;
+		if (itemsToDeleteAtEnd > 0) {
+			deleteSomeFileItems(searchIndex + 1, fileItems.getNumElements());
+			numFileItemsDeletedAtEnd += itemsToDeleteAtEnd;
+		}
+	}
+
+	if (!firstFileItemRemaining.isEmpty()) {
+		int32_t itemsToDeleteAtStart = fileItems.search(firstFileItemRemaining.get());
+		if (itemsToDeleteAtStart) {
+			deleteSomeFileItems(0, itemsToDeleteAtStart);
+			numFileItemsDeletedAtStart += itemsToDeleteAtStart;
+		}
+	}
+}
+
+bool Browser::isFavouritesVisible() {
+	return (getCurrentUI()->canDisplayFavourites() && qwertyVisible
+	        && FlashStorage::defaultFavouritesLayout != FavouritesDefaultLayout::FavouritesDefaultLayoutOff);
+}
+
+bool Browser::isBanksVisible() {
+	return (getCurrentUI()->canDisplayFavourites() && qwertyVisible
+	        && FlashStorage::defaultFavouritesLayout
+	               == FavouritesDefaultLayout::FavouritesDefaultLayoutFavouritesAndBanks);
+}

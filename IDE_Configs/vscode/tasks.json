@@ -1,0 +1,143 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"type": "process",
+			"label": "Build Debug",
+			"command": "./dbt",
+			"windows": {
+				"command": "./dbt.cmd",
+			},
+			"args": [
+				"build",
+				"debug"
+			],
+			"group": {
+				"kind": "build",
+				"isDefault": false
+			},
+			"problemMatcher": {
+				"base": "$gcc",
+				"fileLocation": "absolute"
+			}
+		},
+		{
+			"type": "process",
+			"label": "Build Release",
+			"command": "./dbt",
+			"windows": {
+				"command": "./dbt.cmd",
+			},
+			"args": [
+				"build",
+				"release"
+			],
+			"group": {
+				"kind": "build",
+				"isDefault": false
+			},
+			"problemMatcher": {
+				"base": "$gcc",
+				"fileLocation": "absolute"
+			}
+		},
+		{
+			"type": "process",
+			"label": "Build RelWithDebInfo",
+			"command": "./dbt",
+			"windows": {
+				"command": "./dbt.cmd",
+			},
+			"args": [
+				"build",
+				"relwithdebinfo"
+			],
+			"group": {
+				"kind": "build",
+				"isDefault": false
+			},
+			"problemMatcher": {
+				"base": "$gcc",
+				"fileLocation": "absolute"
+			}
+		},
+		{
+			"type": "process",
+			"label": "Run (USB, dev mode)",
+			"detail": "Build Debug and upload it to a Deluge over USB. Needs the app-loader with DEV MODE: ON.",
+			"command": "./dbt",
+			"windows": {
+				"command": "./dbt.cmd",
+			},
+			"args": [
+				"run"
+			],
+			"group": {
+				"kind": "build",
+				"isDefault": true
+			},
+			"problemMatcher": {
+				"base": "$gcc",
+				"fileLocation": "absolute"
+			}
+		},
+		{
+			"type": "process",
+			"label": "Run Release (USB, dev mode)",
+			"detail": "Build Release and upload it to a Deluge over USB. Needs the app-loader with DEV MODE: ON.",
+			"command": "./dbt",
+			"windows": {
+				"command": "./dbt.cmd",
+			},
+			"args": [
+				"run",
+				"release"
+			],
+			"group": {
+				"kind": "build",
+				"isDefault": false
+			},
+			"problemMatcher": {
+				"base": "$gcc",
+				"fileLocation": "absolute"
+			}
+		},
+		{
+			"type": "process",
+			"label": "Run JLink GDB Server",
+			"problemMatcher": [],
+			"command": "./dbt",
+			"windows": {
+				"command": "./dbt.cmd",
+			},
+			"args": [
+				"debug",
+				"-j",
+			]
+		},
+		{
+			"type": "process",
+			"label": "Run OpenOCD GDB Server",
+			"problemMatcher": [],
+			"command": "./dbt",
+			"windows": {
+				"command": "./dbt.cmd",
+			},
+			"args": [
+				"debug",
+			]
+		},
+		{
+			"type": "process",
+			"label": "Format source",
+			"problemMatcher": [],
+			"command": "./dbt",
+			"windows": {
+				"command": "./dbt.cmd",
+			},
+			"args": [
+				"format",
+			]
+		}
+	]
+}

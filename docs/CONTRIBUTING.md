@@ -1,0 +1,117 @@
+# How to contribute to DelugeFirmware
+
+Above all, thank you for your interest in both the Synthstrom Deluge and being a contributor!
+
+Please see also, the [Code of Conduct](CODE_OF_CONDUCT.md) document.
+
+## LLM usage
+
+This is ultimately a human project. Having an LLM code a fun feature for your own use is great but that 
+does not mean we will include it in our supported firmware. 
+While we welcome the use of LLM assistance (and we all use it) you must put in the effort to ensure your code is explainable and maintainable. 
+A good measure before submitting is ensuring you can read and understand your code clearly enough to hand write a PR description explaining what it does and why. 
+If we feel like we are talking to an LLM we will just close PRs.
+
+As a bare minimum:
+* do not use an agent to open PRs or comment on them
+* do not use an LLM to write PR descriptions 
+* do not open PRs with test plans you have not followed
+
+
+## Bug reports
+
+Even if you are not a software developer you can contribute immensely by informing us about bugs and other problems you
+notice during usage or testing of the firmwares created from this repository and related projects:
+
+* Please submit an [issue](https://github.com/SynthstromAudible/DelugeFirmware/issues) highlighting as much *relevant*
+  context about the bug as possible.
+* Quality of information (rather than quantity, necessarily) is key!
+  See [How to Report Bugs Effectively](https://www.chiark.greenend.org.uk/~sgtatham/bugs.html) by Simon Tatham for more
+  on this topic.
+* Do let us know whether the bug was found on an OLED or 7seg Deluge as this may be important as well as the source and
+  version of firmware (branch/etc.).
+* Where the bug exists in build scripts, editors, or other development, building, and debugging processes, please
+  provide excerpts of the relevant logs if you suspect they might be helpful.
+* Bugs in related projects should be submitted to the appropriate issue tracker:
+    * DelugeProbe: [litui/delugeprobe](https://github.com/litui/delugeprobe).
+    * DBT-Toolchain: [SynthstromAudible/dbt-toolchain](https://github.com/SynthstromAudible/dbt-toolchain/issues).
+
+## Ideas, feature requests, suggestions and discussions
+
+Please use the [Discussions](https://github.com/SynthstromAudible/DelugeFirmware/discussions) feature in our repository
+which allows both creating discussion, ideas, polls and more as well as voting on existing topics.
+
+* Please search first if there is already a (
+  draft) [Pull request](https://github.com/SynthstromAudible/DelugeFirmware/pulls) or existing Discussion item related
+  to your idea and start your discussion from there if possible.
+* Reading, voting and commenting on discussion items and Pull requests will help a lot to improve the direction of the
+  project.
+* Please use the repository [issue](https://github.com/SynthstromAudible/DelugeFirmware/issues) tracker for problem
+  reporting.
+* For further inspiration and discussion there is also
+  the [Deluge Suggestions area](https://forums.synthstrom.com/categories/deluge-suggestions)
+  and [Open Source area](https://forums.synthstrom.com/categories/open-source-) on
+  the [Synthstrom Forum](https://forums.synthstrom.com).
+* For more in-depth technical discussion you are welcome to join the #dev-chat channel in
+  the [Deluge User Discord](https://discord.com/invite/gWaJEh6pPP).
+
+## Repository Contributions
+
+Pull requests that are no longer marked as Draft and are open for merging should be ready to test and any help is
+appreciated.
+
+* This includes both building and testing the firmware as well as reading and reviewing the source code.
+* Please use the review and discussion functionality provided within GitHub.
+* Code reviews are intended to increase quality and should not go into nitpicking, please remember
+  the [Code of Conduct](CODE_OF_CONDUCT.md).
+* Final decisions about merging of Pull requests is up to the code owners, see [Governance](GOVERNANCE.md).
+* If you have a contribution to make then review the [Guidelines for Repository Contributions](/docs/dev/guidelines.md). 
+
+## Labels
+
+Labels are grouped by prefix:
+
+* `type:` (pull requests only): `fix`, `feature`, `refactor`, `deps`, `chore`. Issues use GitHub's
+  native **Issue Type** (Bug, Feature, Task) instead.
+* `area:` which part of the firmware or project is affected, e.g. `area: audio`, `area: midi`,
+  `area: toolchain`.
+* `status:` where an issue or PR stands, e.g. `status: needs-info`, `status: needs-testing`.
+* `impact:` how a bug shows up, e.g. `impact: crash`, `impact: ux-inconsistent`.
+
+`release-blocker` and `beta-blocker` mark items that must be fixed before a release advances.
+Maintainers also set the **Priority** and **Effort** issue fields when triaging.
+
+The full list lives in [`.github/labels.yml`](../.github/labels.yml). To add or change a label, edit that
+file in a pull request; it is synced to GitHub automatically when merged.
+
+Pull requests are labeled automatically: `area:` labels come from the files you change, and the `type:` label
+comes from the box you tick under **Type of change** in the PR template. A bot comment will point out anything
+missing from the description; it never blocks a merge.
+
+## Adding a Runtime Feature Setting (Community Feature)
+
+When introducing a new feature or behavior modification that should be toggleable by users, add a runtime feature setting by following these steps:
+
+1. **Declare the Setting Enum**:
+   - In `src/deluge/model/settings/runtime_feature_settings.h`, add your setting identifier to `enum RuntimeFeatureSettingType` before `MaxElement` (e.g. `ShortcutOverlay`).
+   - If your setting has more states than simple On/Off, define a corresponding enum (e.g., `RuntimeFeatureState...`).
+
+2. **Add Localization (l10n) Strings**:
+   - `src/deluge/gui/l10n/strings.h`: Add a `STRING_FOR_COMMUNITY_FEATURE_...` identifier to `enum class String`.
+   - `src/deluge/gui/l10n/english.json`: Add the key and the OLED display name string.
+   - `src/deluge/gui/l10n/seven_segment.json`: If supported on 7-segment displays, add the 4-character abbreviation.
+   - Run `./dbt build` (or `python3 src/deluge/gui/l10n/generate.py ...`) to regenerate `g_english.cpp` and `g_seven_segment.cpp`.
+
+3. **Initialize the Setting**:
+   - In `src/deluge/model/settings/runtime_feature_settings.cpp`, inside `RuntimeFeatureSettings::init()`, configure the setting using `SetupOnOffSetting(...)` (or custom setup function), providing the setting slot, the l10n string identifier, the XML attribute name for `CommunityFeatures.XML`, and the default state.
+
+4. **Create the Associated Menu Item**:
+   - In `src/deluge/gui/menu_item/runtime_feature/settings.cpp`, instantiate a `SettingToggle` (or `OledOnlySettingToggle` if OLED-only) instance for your setting type.
+   - Add a pointer to this menu instance into the `subMenuEntries` array.
+
+5. **Guard the Feature in Code**:
+   - Include `model/settings/runtime_feature_settings.h` where needed and check `runtimeFeatureSettings.isOn(RuntimeFeatureSettingType::YourSetting)` or `runtimeFeatureSettings.get(RuntimeFeatureSettingType::YourSetting)`.
+
+## Additional Developer Resources
+
+* Access more developer resources in [Additional Information](/docs/dev/additional_info.md).
