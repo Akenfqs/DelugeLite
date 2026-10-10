@@ -548,8 +548,9 @@ void registerTasks() {
 
 	// 0-9: High priority (10 for dyn tasks)
 	uint8_t p = 0;
-	AudioEngine::routine_task_id = addRepeatingTask(&(AudioEngine::routine_task), p++, 8 / 44100., 64 / 44100.,
-	                                                128 / 44100., "audio  routine", RESOURCE_NONE);
+	AudioEngine::routine_task_id = addRepeatingTask(&(AudioEngine::routine_task), p++, 8 / 44100.,
+	                                                (64 * AUDIO_BLOCK_SCALE) / 44100., // DelugeLite: scaled
+	                                                (128 * AUDIO_BLOCK_SCALE) / 44100., "audio  routine", RESOURCE_NONE);
 	addRepeatingTask(MidiEngine::check_incoming_usb, p++, 0.0005, 0.0005, 0.001, "check usb midi", RESOURCE_USB);
 
 	// Polling both phases catches slow B-only transitions; A-edge IRQs still capture fast movement promptly.

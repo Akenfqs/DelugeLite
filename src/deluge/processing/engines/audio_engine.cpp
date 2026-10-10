@@ -120,9 +120,11 @@ namespace AudioEngine {
 // seconds it will work maybe this should be user configurable? Values from 60-100 all seem justifiable. 100
 // occasionally crackles but means more voices. 60 keeps the modulation updating at about 800hz and LFO2 goes up to
 // 100ish
-constexpr int32_t numSamplesLimit = 80;
+// DelugeLite: these are measured in "samples of render time per audio routine call". A bigger audio block means
+// proportionally longer renders for the same CPU load, so they scale with AUDIO_BLOCK_SCALE (1 = upstream).
+constexpr int32_t numSamplesLimit = 80 * AUDIO_BLOCK_SCALE;
 // used for decisions in rendering engine
-constexpr int32_t direnessThreshold = numSamplesLimit - 30;
+constexpr int32_t direnessThreshold = numSamplesLimit - (30 * AUDIO_BLOCK_SCALE);
 
 // 7 can overwhelm SD bandwidth if we schedule the loads badly. It could be improved by starting future loads
 // earlier for now we provide an outlet in culling a single voice if we're under MIN_VOICES and still getting close
@@ -437,9 +439,9 @@ void cullVoices(size_t numSamples, int32_t numAudio, int32_t numVoice) {
 	if (numAudio + numVoice > MIN_VOICES) {
 
 		// If it's real dire, do a proper immediate cull
-		if (num_samples_over_limit >= 32) {
+		if (num_samples_over_limit >= 32 * AUDIO_BLOCK_SCALE) {
 
-			int32_t num_to_cull = (num_samples_over_limit >> 4);
+			int32_t num_to_cull = (num_samples_over_limit / (16 * AUDIO_BLOCK_SCALE));
 			// leave at least 7 - below this point culling won't save us
 			// if they can't load their sample in time they'll stop the same way anyway
 			num_to_cull = std::min(num_to_cull, numAudio + numVoice - MIN_VOICES);
@@ -483,7 +485,7 @@ void cullVoices(size_t numSamples, int32_t numAudio, int32_t numVoice) {
 	}
 	else {
 		// Cull anyway if things are bad
-		if (num_samples_over_limit >= 40) {
+		if (num_samples_over_limit >= 40 * AUDIO_BLOCK_SCALE) {
 			D_PRINTLN("under min voices but culling anyway");
 			terminateOneVoice(numSamples);
 			culled = true;
@@ -511,7 +513,9 @@ inline void setDireness(size_t numSamples) { // Consider direness and culling - 
 	// don't smooth this - used for other decisions as well
 	if (numSamples >= direnessThreshold) {
 
-		int32_t newDireness = std::min<int32_t>(numSamples - (direnessThreshold - 1), 14);
+		// DelugeLite: divide by the block scale so direness keeps its upstream 0-14 meaning
+		int32_t newDireness =
+		    std::min<int32_t>((numSamples - (direnessThreshold - 1) + AUDIO_BLOCK_SCALE - 1) / AUDIO_BLOCK_SCALE, 14);
 
 		if (newDireness >= cpuDireness) {
 			cpuDireness = newDireness;
@@ -532,7 +536,7 @@ inline void setDireness(size_t numSamples) { // Consider direness and culling - 
 		}
 	}
 	// otherwise lower it (with some hysteresis to avoid jittering
-	else if (numSamples < direnessThreshold - 3) {
+	else if (numSamples < direnessThreshold - (3 * AUDIO_BLOCK_SCALE)) {
 
 		if ((int32_t)(audioSampleTimer - timeDirenessChanged) >= (kSampleRate >> 3)) { // Only if it's been long enough
 			timeDirenessChanged = audioSampleTimer;
@@ -609,7 +613,7 @@ bool calledFromScheduler = false;
 	numSamples = std::min(numSamples, maxAdjustedNumSamples);
 
 	// Want to round to be doing a multiple of 4 samples, so the NEON functions can be utilized most efficiently.
-	// Note - this can take numSamples up as high as SSI_TX_BUFFER_NUM_SAMPLES (currently 128).
+	// Note - this can take numSamples up as high as SSI_TX_BUFFER_NUM_SAMPLES (128 upstream, 256 in DelugeLite).
 	if (numSamples >= 3) {
 		numSamples = (numSamples + 2) & ~3;
 	}
@@ -1135,7 +1139,8 @@ bool doSomeOutputting() {
 	// Copy to actual output buffer, and apply heaps of gain too, with clipping
 	int32_t numSamplesOutputted = 0;
 
-	std::span<StereoSample> outputBufferForResampling{reinterpret_cast<StereoSample*>(spareRenderingBuffer), 128 * 2};
+	std::span<StereoSample> outputBufferForResampling{reinterpret_cast<StereoSample*>(spareRenderingBuffer),
+	                                                  SSI_TX_BUFFER_NUM_SAMPLES * 2};
 	StereoSample* __restrict__ renderingBufferOutputPosNow = renderingBufferOutputPos;
 	int32_t* __restrict__ i2sTXBufferPosNow = (int32_t*)i2sTXBufferPos;
 	int32_t* __restrict__ inputReadPos = (int32_t*)i2sRXBufferPos;

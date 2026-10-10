@@ -833,7 +833,8 @@ constexpr int32_t kInputPercBufferSize = (kInputRawBufferSize >> kPercBufferRedu
 #define TIME_STRETCH_ENABLE_BUFFER 0
 
 namespace TimeStretch {
-constexpr int32_t kDefaultFirstHopLength = 200;
+// DelugeLite: must be >= SSI_TX_BUFFER_NUM_SAMPLES (see static_assert in voice_sample.cpp), so 256 with a 256 ring
+constexpr int32_t kDefaultFirstHopLength = (SSI_TX_BUFFER_NUM_SAMPLES > 200) ? SSI_TX_BUFFER_NUM_SAMPLES : 200;
 
 namespace Crossfade {
 

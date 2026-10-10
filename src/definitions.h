@@ -48,7 +48,18 @@ extern void freezeWithError(char const* errmsg);
 /// Runs as 32.792 ticks per microsecond (33.792 MHz)
 #define TIMER_SYSTEM_SUPERFAST 1
 
-#define SSI_TX_BUFFER_NUM_SAMPLES 128
+// DelugeLite: size of the circular audio output (I2S TX) ring, which is also the maximum render window.
+// Set from CMake (DELUGELITE_AUDIO_BLOCK_SAMPLES). 128 is the upstream value. Must be a power of two.
+// Everything that depends on it is derived from AUDIO_BLOCK_SCALE below - see docs/delugelite/LATENCY.md
+#ifndef DELUGELITE_AUDIO_BLOCK_SAMPLES
+#define DELUGELITE_AUDIO_BLOCK_SAMPLES 128
+#endif
+#define SSI_TX_BUFFER_NUM_SAMPLES DELUGELITE_AUDIO_BLOCK_SAMPLES
+/// 1 for the upstream 128-sample ring, 2 for 256. Used to scale timing thresholds tuned for 128.
+#define AUDIO_BLOCK_SCALE (SSI_TX_BUFFER_NUM_SAMPLES / 128)
+#if (SSI_TX_BUFFER_NUM_SAMPLES != 128) && (SSI_TX_BUFFER_NUM_SAMPLES != 256)
+#error "SSI_TX_BUFFER_NUM_SAMPLES must be 128 or 256"
+#endif
 #define SSI_RX_BUFFER_NUM_SAMPLES 2048
 #define NUM_MONO_INPUT_CHANNELS (NUM_STEREO_INPUT_CHANNELS * 2)
 #define NUM_MONO_OUTPUT_CHANNELS (NUM_STEREO_OUTPUT_CHANNELS * 2)

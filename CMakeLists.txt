@@ -70,6 +70,15 @@ option(ENABLE_SYSEX_LOAD "Enable loading firmware over midi sysex" OFF)
 # MATRIX DRIVER pad logging
 option(ENABLE_MATRIX_DEBUG "Enable logging of pad events" OFF)
 
+# DelugeLite: audio output block size (samples). 128 = upstream behaviour (~2.9 ms output ring),
+# 256 = DelugeLite default (~5.8 ms ring, fewer per-block overheads). See docs/delugelite/LATENCY.md
+set(DELUGELITE_AUDIO_BLOCK_SAMPLES 256 CACHE STRING "Audio output ring / max render window in samples (128 or 256)")
+set_property(CACHE DELUGELITE_AUDIO_BLOCK_SAMPLES PROPERTY STRINGS 128 256)
+if(NOT DELUGELITE_AUDIO_BLOCK_SAMPLES MATCHES "^(128|256)$")
+    message(FATAL_ERROR "DELUGELITE_AUDIO_BLOCK_SAMPLES must be 128 or 256")
+endif()
+add_compile_definitions(DELUGELITE_AUDIO_BLOCK_SAMPLES=${DELUGELITE_AUDIO_BLOCK_SAMPLES})
+
 # Colored output
 set(CMAKE_COLOR_DIAGNOSTICS ON)
 add_compile_options($<$<CXX_COMPILER_ID:Clang>:-fansi-escape-codes>)
