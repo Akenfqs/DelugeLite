@@ -1,3 +1,7 @@
+> **This is DelugeLite**, a performance-focused fork of the Deluge community firmware
+> (more voices, more concurrent samples, 7-segment only). See [DELUGELITE.md](DELUGELITE.md).
+> Everything below is the upstream README.
+
 # Deluge Community Firmware
 
 ## Dear Deluge owners
