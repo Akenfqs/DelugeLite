@@ -286,6 +286,7 @@ void killOneVoice(size_t num_samples) {
 		if (currentSong) {
 			currentSong->cullAudioClipVoice();
 		}
+		return; // DelugeLite: `it` is end() here and must not be dereferenced
 	}
 
 	const Sound::ActiveVoice& voice = *it;
